@@ -10,6 +10,14 @@ capability actions.
 
 Targets **net8.0**, so it runs on .NET 8 and later.
 
+Not on NuGet yet, and NuGet has no git-install equivalent, so reference the
+project directly:
+
+```bash
+git clone --branch v0.2.0 https://github.com/homeCore-io/hc-plugin-sdk-dotnet
+dotnet add reference ../hc-plugin-sdk-dotnet/HomeCoreSdk.csproj
+```
+
 ## Your first plugin
 
 ```csharp
