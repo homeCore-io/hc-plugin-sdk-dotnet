@@ -35,8 +35,8 @@ await client.RunAsync();
 
 ## What this SDK does not have
 
-The Rust and Python SDKs are ahead of this one in two places worth knowing
-about before you choose a language:
+The Rust, Python and Node.js SDKs are ahead of this one in two places worth
+knowing about before you choose a language:
 
 - **Notices** — the structured, self-clearing problem reports the web UI shows
   on a plugin's card ("bridge unreachable", "no devices found yet"). A plugin
@@ -48,7 +48,7 @@ about before you choose a language:
 
 It also subscribes to `homecore/devices/+/cmd`, so it receives commands for
 devices belonging to other plugins and your handler has to ignore them. The
-Rust and Python SDKs subscribe per device.
+Rust, Python and Node.js SDKs subscribe per device.
 
 Everything else — registration, state publishing, availability, the
 management protocol, log forwarding — is the same across all four SDKs.
