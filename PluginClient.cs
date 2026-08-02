@@ -129,10 +129,11 @@ public sealed class PluginClient : IAsyncDisposable
     private ManagementOptions? _mgmt;
     private CancellationTokenSource? _heartbeatCts;
 
-    // Devices this plugin has registered. Drives the heartbeat's device_count
-    // and, more importantly, decides which command topics we subscribe to.
-    private readonly HashSet<string> _devices = new();
-    private readonly object _devicesLock = new();
+    // Devices this plugin has registered. Drives the heartbeat's device_count,
+    // decides which command topics we subscribe to, and — once persistence is
+    // enabled — survives a restart so ReconcileDevicesAsync can tell what has
+    // since disappeared.
+    private readonly DeviceTracker _devices;
     private readonly Dictionary<string, StreamContext> _activeStreams = new();
     private readonly object _streamsLock = new();
 
@@ -184,6 +185,7 @@ public sealed class PluginClient : IAsyncDisposable
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? NullLogger.Instance;
+        _devices = new DeviceTracker(_logger);
 
         var factory = new MqttFactory();
         _mqtt = factory.CreateMqttClient();
@@ -225,8 +227,7 @@ public sealed class PluginClient : IAsyncDisposable
         // the same devices again — idempotent, but this covers lazy
         // registration. There is deliberately no `homecore/devices/+/cmd`
         // wildcard here: it delivered every other plugin's commands to this one.
-        List<string> known;
-        lock (_devicesLock) known = _devices.ToList();
+        var known = _devices.Snapshot().OrderBy(x => x, StringComparer.Ordinal).ToList();
         foreach (var deviceId in known)
             await SubscribeCommandsAsync(deviceId);
 
@@ -363,7 +364,7 @@ public sealed class PluginClient : IAsyncDisposable
     /// </remarks>
     public Task SubscribeCommandsAsync(string deviceId)
     {
-        lock (_devicesLock) _devices.Add(deviceId);
+        _devices.Add(deviceId);
         if (!_mqtt.IsConnected) return Task.CompletedTask;
         return _mqtt.SubscribeAsync(
             new MqttTopicFilterBuilder()
@@ -375,10 +376,93 @@ public sealed class PluginClient : IAsyncDisposable
     /// <summary>Stop receiving commands for one device.</summary>
     public Task UnsubscribeCommandsAsync(string deviceId)
     {
-        lock (_devicesLock) _devices.Remove(deviceId);
+        _devices.Remove(deviceId);
         return _mqtt.IsConnected
             ? _mqtt.UnsubscribeAsync($"homecore/devices/{deviceId}/cmd")
             : Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Remember across restarts which devices this plugin registered.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Call once at startup, before registering anything. The plugin id is
+    /// inserted into the filename, so plugins sharing a config directory cannot
+    /// share a snapshot and retire each other's devices.
+    /// </para>
+    /// <para>
+    /// Without this, <see cref="ReconcileDevicesAsync"/> can only see devices
+    /// registered in the <i>current</i> process, so anything dropped while the
+    /// plugin was down lingers in homeCore forever.
+    /// </para>
+    /// </remarks>
+    /// <param name="path">
+    /// Typically <c>&lt;configDir&gt;/.published-device-ids.json</c>.
+    /// </param>
+    public void EnableDevicePersistence(string path) =>
+        _devices.EnablePersistence(DeviceTracker.ScopedSnapshotPath(path, PluginId));
+
+    /// <summary>
+    /// Unregister every device this plugin knows about that is not in
+    /// <paramref name="live"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The "set what is live this cycle, let the SDK clean up the rest"
+    /// workflow. Combined with <see cref="EnableDevicePersistence"/> it also
+    /// retires devices registered in earlier runs.
+    /// </para>
+    /// <para>
+    /// <b>Only call this after a sync you trust.</b> On a partial fetch it will
+    /// unregister live devices behind a temporarily unreachable upstream —
+    /// which looks exactly like the bug it exists to prevent, but worse,
+    /// because the devices were fine. Track an "everything succeeded" flag
+    /// across your per-source loop and pass the live set only when it holds.
+    /// </para>
+    /// <para>
+    /// Ids in <paramref name="live"/> that were never registered are reported
+    /// in <see cref="ReconcileReport.UnknownInLive"/> and otherwise ignored —
+    /// register them first if you meant to keep them.
+    /// </para>
+    /// </remarks>
+    public async Task<ReconcileReport> ReconcileDevicesAsync(IEnumerable<string> live)
+    {
+        var liveSet = live as HashSet<string> ?? new HashSet<string>(live);
+        var known = _devices.Snapshot();
+
+        var stale = known.Except(liveSet).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        var unknown = liveSet.Except(known).OrderBy(x => x, StringComparer.Ordinal).ToList();
+
+        var unregistered = new List<string>(stale.Count);
+        foreach (var deviceId in stale)
+        {
+            try
+            {
+                await UnregisterDeviceAsync(deviceId);
+                unregistered.Add(deviceId);
+                _logger.LogInformation("Unregistered stale device {DeviceId}", deviceId);
+            }
+            catch (Exception ex)
+            {
+                // One failure must not stop the rest.
+                _logger.LogWarning(
+                    "Failed to unregister stale device {DeviceId}: {Error}", deviceId, ex.Message);
+            }
+        }
+
+        if (unknown.Count > 0)
+        {
+            _logger.LogDebug(
+                "ReconcileDevices saw {Count} live ids not registered with the SDK; "
+                + "register them first if they should be kept", unknown.Count);
+        }
+
+        return new ReconcileReport
+        {
+            StaleUnregistered = unregistered,
+            UnknownInLive = unknown,
+        };
     }
 
     /// <summary>
@@ -502,9 +586,7 @@ public sealed class PluginClient : IAsyncDisposable
             // Belt and braces alongside the per-device subscription: a broker
             // that hands us a topic we did not ask for must not turn into this
             // plugin acting on another plugin's device.
-            bool owned;
-            lock (_devicesLock) owned = _devices.Contains(deviceId);
-            if (!owned) return;
+            if (!_devices.Contains(deviceId)) return;
 
             JsonElement payload;
             try
@@ -831,8 +913,7 @@ public sealed class PluginClient : IAsyncDisposable
     internal async Task PublishHeartbeatAsync()
     {
         if (_mgmt is null) return;
-        int deviceCount;
-        lock (_devicesLock) deviceCount = _devices.Count;
+        var deviceCount = _devices.Count;
 
         var payload = new JsonObject
         {

@@ -231,12 +231,12 @@ public class PluginClientTests
         var c = NewClient();
         await c.SubscribeCommandsAsync("light.01");
 
-        var devices = (HashSet<string>)typeof(PluginClient)
+        var devices = (DeviceTracker)typeof(PluginClient)
             .GetField("_devices", BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(c)!;
-        Assert.Contains("light.01", devices);
+        Assert.True(devices.Contains("light.01"));
 
         await c.UnsubscribeCommandsAsync("light.01");
-        Assert.DoesNotContain("light.01", devices);
+        Assert.False(devices.Contains("light.01"));
     }
 }

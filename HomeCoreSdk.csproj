@@ -23,6 +23,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The test project asserts on internals that plugin authors should not
+         see: the device tracker's path scoping, and the management dispatcher. -->
+    <InternalsVisibleTo Include="HomeCore.PluginSdk.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="MQTTnet" Version="4.*" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.*" />
   </ItemGroup>
