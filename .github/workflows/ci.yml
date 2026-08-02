@@ -1,12 +1,13 @@
 # CI for the .NET plugin SDK.
 #
-# Build only: this repo has no test project, so there is nothing to run yet.
-# That is still worth doing — the SDK is one source file and a csproj that
-# nothing has ever compiled in CI, so a change that does not build could be
-# committed and nobody would know until someone tried to use it.
+# The library targets net8.0 for broad compatibility; the test project targets
+# the current runtime, so `dotnet test` works on a machine with only the latest
+# .NET installed. CI therefore installs both: 8.0 to run anything built against
+# the library's own target, 10.0 for the tests.
 #
 # `-warnaserror` because the project sets `<Nullable>enable</Nullable>`, and a
-# nullability warning in an SDK is a bug in someone else's code later.
+# nullability warning in an SDK becomes a NullReferenceException in somebody
+# else's plugin.
 name: CI
 
 on:
@@ -20,16 +21,21 @@ permissions:
 
 jobs:
   ci:
-    name: build
+    name: build + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-dotnet@v4
         with:
-          # Matches <TargetFramework>net8.0</TargetFramework>.
-          dotnet-version: "8.0.x"
+          dotnet-version: |
+            8.0.x
+            10.0.x
 
-      - run: dotnet restore
+      - run: dotnet restore HomeCoreSdk.csproj
 
-      - run: dotnet build --no-restore --configuration Release -warnaserror
+      - name: Build the library
+        run: dotnet build HomeCoreSdk.csproj --no-restore --configuration Release -warnaserror
+
+      - name: Tests
+        run: dotnet test tests/HomeCore.PluginSdk.Tests.csproj --configuration Release

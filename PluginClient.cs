@@ -67,6 +67,12 @@ public sealed class ManagementOptions
 
     /// <summary>Path to the plugin config file (enables get_config/set_config).</summary>
     public string? ConfigPath { get; init; }
+
+    /// <summary>
+    /// The action manifest. Declared actions become buttons on the plugin's
+    /// page in hc-web and calls hc-mcp can make.
+    /// </summary>
+    public Capabilities? Capabilities { get; init; }
 }
 
 /// <summary>
@@ -78,6 +84,35 @@ public delegate Task CommandHandler(string deviceId, JsonElement payload);
 /// Delegate for handling management commands (set_log_level, custom actions).
 /// </summary>
 public delegate Task<JsonObject?> ManagementCommandHandler(string action, JsonElement command);
+
+/// <summary>
+/// Handles a capability action declared in the manifest.
+/// </summary>
+/// <param name="action">The action id.</param>
+/// <param name="params">Everything the command carried but the envelope.</param>
+/// <param name="ctx">
+/// Present only for streaming actions. Report through it and return null.
+/// </param>
+/// <returns>
+/// The result of an immediate action, or null to say "not mine" — the SDK then
+/// answers with <c>unknown action</c>.
+/// </returns>
+public delegate Task<JsonObject?> ActionHandler(string action, JsonElement @params, StreamContext? ctx);
+
+/// <summary>Handles a state update for a device this plugin does not own.</summary>
+public delegate Task StateHandler(string deviceId, JsonElement state);
+
+/// <summary>
+/// Handles a structured <c>set_config</c> payload.
+/// </summary>
+/// <remarks>
+/// homeCore sends config as raw text when the operator edits TOML directly, and
+/// as an object when the plugin declared a <c>ConfigSchema</c> and the UI
+/// rendered a form. The SDK writes the text form verbatim; it cannot turn an
+/// object into TOML, so handle this if you declare a schema.
+/// </remarks>
+/// <returns>True if you handled and persisted it.</returns>
+public delegate Task<bool> SetConfigHandler(JsonElement config);
 
 /// <summary>
 /// Connected HomeCore plugin client.
@@ -94,6 +129,23 @@ public sealed class PluginClient : IAsyncDisposable
     private ManagementOptions? _mgmt;
     private CancellationTokenSource? _heartbeatCts;
 
+    // Devices this plugin has registered. Drives the heartbeat's device_count
+    // and, more importantly, decides which command topics we subscribe to.
+    private readonly HashSet<string> _devices = new();
+    private readonly object _devicesLock = new();
+    private readonly Dictionary<string, StreamContext> _activeStreams = new();
+    private readonly object _streamsLock = new();
+
+    /// <summary>This SDK's version, reported in every heartbeat.</summary>
+    public const string SdkVersion = "0.2.0";
+
+    /// <summary>
+    /// The wire protocol this SDK speaks, which is core's hc-types version.
+    /// Core compares it against its own to decide whether the two agree on the
+    /// shape of a device, an event and a command.
+    /// </summary>
+    public const string ProtocolVersion = "0.1.5";
+
     /// <summary>The plugin identifier.</summary>
     public string PluginId => _options.PluginId;
 
@@ -107,6 +159,24 @@ public sealed class PluginClient : IAsyncDisposable
     /// <summary>Fired after the MQTT connection is established.</summary>
     public event Func<Task>? OnConnected;
 
+    /// <summary>Handles capability actions. See <see cref="ActionHandler"/>.</summary>
+    public ActionHandler? OnAction { get; set; }
+
+    /// <summary>
+    /// A device subscribed to with <see cref="SubscribeStateAsync"/> changed.
+    /// Only for cross-device consumers.
+    /// </summary>
+    public StateHandler? OnState { get; set; }
+
+    /// <summary>Accepts a structured config write. See <see cref="SetConfigHandler"/>.</summary>
+    public SetConfigHandler? OnSetConfig { get; set; }
+
+    /// <summary>
+    /// Conditions this plugin is currently reporting about itself. Raised and
+    /// cleared by your code, republished in full on every heartbeat.
+    /// </summary>
+    public PluginNotices Notices { get; }
+
     public PluginClient(PluginOptions options, ILogger? logger = null)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
@@ -114,6 +184,15 @@ public sealed class PluginClient : IAsyncDisposable
 
         var factory = new MqttFactory();
         _mqtt = factory.CreateMqttClient();
+
+        // Notices ride on the heartbeat, so a change publishes one immediately —
+        // otherwise a condition raised at startup would not reach the UI until
+        // the next beat, up to a minute later.
+        Notices = new PluginNotices(() =>
+        {
+            if (_mgmt is not null && _mqtt.IsConnected)
+                _ = PublishHeartbeatAsync();
+        });
 
         _mqtt.ApplicationMessageReceivedAsync += HandleMessageAsync;
     }
@@ -138,13 +217,26 @@ public sealed class PluginClient : IAsyncDisposable
         _logger.LogInformation("Connected to HomeCore broker at {Host}:{Port}",
             _options.EffectiveBrokerHost, _options.EffectiveBrokerPort);
 
-        // Subscribe to device commands for this plugin.
-        await _mqtt.SubscribeAsync(
-            new MqttTopicFilterBuilder()
-                .WithTopic("homecore/devices/+/cmd")
-                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
-                .Build(),
-            ct);
+        // Re-subscribe to the devices we already knew about. On a reconnect the
+        // broker has forgotten our subscriptions, and OnConnected may register
+        // the same devices again — idempotent, but this covers lazy
+        // registration. There is deliberately no `homecore/devices/+/cmd`
+        // wildcard here: it delivered every other plugin's commands to this one.
+        List<string> known;
+        lock (_devicesLock) known = _devices.ToList();
+        foreach (var deviceId in known)
+            await SubscribeCommandsAsync(deviceId);
+
+        if (_mgmt is not null)
+        {
+            await _mqtt.SubscribeAsync(
+                new MqttTopicFilterBuilder()
+                    .WithTopic($"homecore/plugins/{PluginId}/manage/cmd")
+                    .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
+                    .Build(),
+                ct);
+            await PublishCapabilitiesAsync();
+        }
 
         if (OnConnected is not null)
             await OnConnected.Invoke();
@@ -206,7 +298,7 @@ public sealed class PluginClient : IAsyncDisposable
     // ── Device Registration ───────────────────────────────────────────────
 
     /// <summary>Register a device with a JSON capability schema.</summary>
-    public Task RegisterDeviceAsync(string deviceId, string name, object capabilities, string? area = null)
+    public async Task RegisterDeviceAsync(string deviceId, string name, object capabilities, string? area = null)
     {
         var payload = new JsonObject
         {
@@ -216,11 +308,12 @@ public sealed class PluginClient : IAsyncDisposable
             ["capabilities"] = JsonSerializer.SerializeToNode(capabilities),
         };
         if (area is not null) payload["area"] = area;
-        return PublishAsync($"homecore/plugins/{PluginId}/register", payload, retain: false);
+        await PublishAsync($"homecore/plugins/{PluginId}/register", payload, retain: false);
+        await TrackDeviceAsync(deviceId);
     }
 
     /// <summary>Register a device by type name (HomeCore resolves capabilities from catalog).</summary>
-    public Task RegisterDeviceTypedAsync(
+    public async Task RegisterDeviceTypedAsync(
         string deviceId, string name, string deviceType, string? area = null)
     {
         var payload = new JsonObject
@@ -231,11 +324,12 @@ public sealed class PluginClient : IAsyncDisposable
             ["device_type"] = deviceType,
         };
         if (area is not null) payload["area"] = area;
-        return PublishAsync($"homecore/plugins/{PluginId}/register", payload, retain: false);
+        await PublishAsync($"homecore/plugins/{PluginId}/register", payload, retain: false);
+        await TrackDeviceAsync(deviceId);
     }
 
     /// <summary>Register a device with all optional fields.</summary>
-    public Task RegisterDeviceFullAsync(
+    public async Task RegisterDeviceFullAsync(
         string deviceId, string name,
         string? deviceType = null, string? area = null, object? capabilities = null)
     {
@@ -248,20 +342,73 @@ public sealed class PluginClient : IAsyncDisposable
         if (deviceType is not null) payload["device_type"] = deviceType;
         if (area is not null) payload["area"] = area;
         if (capabilities is not null) payload["capabilities"] = JsonSerializer.SerializeToNode(capabilities);
-        return PublishAsync($"homecore/plugins/{PluginId}/register", payload, retain: false);
+        await PublishAsync($"homecore/plugins/{PluginId}/register", payload, retain: false);
+        await TrackDeviceAsync(deviceId);
     }
 
     /// <summary>Publish a device capability schema (retained).</summary>
     public Task RegisterDeviceSchemaAsync(string deviceId, object schema) =>
         PublishAsync($"homecore/devices/{deviceId}/schema", schema, retain: true);
 
-    /// <summary>Subscribe to command messages for a specific device.</summary>
-    public Task SubscribeCommandsAsync(string deviceId) =>
-        _mqtt.SubscribeAsync(
+    /// <summary>
+    /// Receive commands for one device.
+    /// </summary>
+    /// <remarks>
+    /// Every <c>RegisterDevice*</c> call does this for you, so you rarely need
+    /// it. Reach for it only when homeCore knows about a device this plugin did
+    /// not register.
+    /// </remarks>
+    public Task SubscribeCommandsAsync(string deviceId)
+    {
+        lock (_devicesLock) _devices.Add(deviceId);
+        if (!_mqtt.IsConnected) return Task.CompletedTask;
+        return _mqtt.SubscribeAsync(
             new MqttTopicFilterBuilder()
                 .WithTopic($"homecore/devices/{deviceId}/cmd")
                 .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
                 .Build());
+    }
+
+    /// <summary>Stop receiving commands for one device.</summary>
+    public Task UnsubscribeCommandsAsync(string deviceId)
+    {
+        lock (_devicesLock) _devices.Remove(deviceId);
+        return _mqtt.IsConnected
+            ? _mqtt.UnsubscribeAsync($"homecore/devices/{deviceId}/cmd")
+            : Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Receive <i>state</i> updates for a device this plugin does not own.
+    /// </summary>
+    /// <remarks>
+    /// For cross-device consumers — a thermostat reading sensors that belong to
+    /// other plugins. Updates arrive on <see cref="OnState"/>. The broker ACL
+    /// has to allow it: such a plugin needs
+    /// <c>allow_sub = ["homecore/devices/+/state"]</c>, broader than a typical
+    /// plugin's.
+    /// </remarks>
+    public Task SubscribeStateAsync(string deviceId) =>
+        _mqtt.SubscribeAsync(
+            new MqttTopicFilterBuilder()
+                .WithTopic($"homecore/devices/{deviceId}/state")
+                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
+                .Build());
+
+    /// <summary>Stop receiving state for a device.</summary>
+    public Task UnsubscribeStateAsync(string deviceId) =>
+        _mqtt.UnsubscribeAsync($"homecore/devices/{deviceId}/state");
+
+    /// <summary>
+    /// Record a device as ours and subscribe to its command topic.
+    /// </summary>
+    /// <remarks>
+    /// Registration and subscription are one step here on purpose. In the Rust
+    /// SDK they are separate calls, and forgetting the second is the classic
+    /// first-plugin bug: the device appears in homeCore, its state updates, and
+    /// every command silently goes nowhere.
+    /// </remarks>
+    private Task TrackDeviceAsync(string deviceId) => SubscribeCommandsAsync(deviceId);
 
     /// <summary>Unregister a device: clear retained topics and publish unregister message.</summary>
     public async Task UnregisterDeviceAsync(string deviceId)
@@ -273,6 +420,7 @@ public sealed class PluginClient : IAsyncDisposable
             $"homecore/plugins/{PluginId}/unregister",
             new { device_id = deviceId },
             retain: false);
+        await UnsubscribeCommandsAsync(deviceId);
     }
 
     // ── Management Protocol ───────────────────────────────────────────────
@@ -285,6 +433,7 @@ public sealed class PluginClient : IAsyncDisposable
     public async Task EnableManagementAsync(ManagementOptions options, CancellationToken ct = default)
     {
         _mgmt = options;
+        if (options.Capabilities is not null) options.Capabilities.PluginId = PluginId;
 
         // Subscribe to management command topic.
         await _mqtt.SubscribeAsync(
@@ -294,9 +443,13 @@ public sealed class PluginClient : IAsyncDisposable
                 .Build(),
             ct);
 
-        // Start heartbeat publisher.
+        await PublishCapabilitiesAsync();
+
+        // Start heartbeat publisher, and beat once now rather than making the
+        // operator wait a full interval to see the plugin at all.
         _heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _ = Task.Run(() => HeartbeatLoopAsync(options, _heartbeatCts.Token), _heartbeatCts.Token);
+        await PublishHeartbeatAsync();
 
         _logger.LogInformation(
             "Management protocol enabled (heartbeat every {Interval}s)",
@@ -343,6 +496,13 @@ public sealed class PluginClient : IAsyncDisposable
             && parts[3] == "cmd")
         {
             var deviceId = parts[2];
+            // Belt and braces alongside the per-device subscription: a broker
+            // that hands us a topic we did not ask for must not turn into this
+            // plugin acting on another plugin's device.
+            bool owned;
+            lock (_devicesLock) owned = _devices.Contains(deviceId);
+            if (!owned) return;
+
             JsonElement payload;
             try
             {
@@ -362,6 +522,26 @@ public sealed class PluginClient : IAsyncDisposable
                 {
                     _logger.LogWarning(ex, "Command handler failed for {DeviceId}", deviceId);
                 }
+            }
+            return;
+        }
+
+        // homecore/devices/{id}/state — a device owned by someone else, for
+        // cross-device consumers.
+        if (parts.Length == 4
+            && parts[0] == "homecore"
+            && parts[1] == "devices"
+            && parts[3] == "state"
+            && OnState is not null)
+        {
+            try
+            {
+                var state = JsonDocument.Parse(e.ApplicationMessage.PayloadSegment).RootElement;
+                await OnState.Invoke(parts[2], state);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "State handler failed for {DeviceId}", parts[2]);
             }
             return;
         }
@@ -428,30 +608,7 @@ public sealed class PluginClient : IAsyncDisposable
                 return ErrorResponse(requestId, "no config path configured");
 
             case "set_config":
-                if (_mgmt?.ConfigPath is { } setPath)
-                {
-                    if (cmd.TryGetProperty("config", out var cfg))
-                    {
-                        try
-                        {
-                            var configStr = cfg.ValueKind == JsonValueKind.String
-                                ? cfg.GetString()!
-                                : cfg.GetRawText();
-                            await File.WriteAllTextAsync(setPath, configStr);
-                            return new JsonObject
-                            {
-                                ["request_id"] = requestId,
-                                ["status"] = "ok",
-                            };
-                        }
-                        catch (Exception ex)
-                        {
-                            return ErrorResponse(requestId, $"failed to write config: {ex.Message}");
-                        }
-                    }
-                    return ErrorResponse(requestId, "missing 'config' field");
-                }
-                return ErrorResponse(requestId, "no config path configured");
+                return await HandleSetConfigAsync(cmd, requestId);
 
             case "set_log_level":
                 var level = cmd.TryGetProperty("level", out var lv) ? lv.GetString() ?? "info" : "info";
@@ -463,32 +620,246 @@ public sealed class PluginClient : IAsyncDisposable
                     ["note"] = "log level change acknowledged",
                 };
 
+            case "cancel":
+            {
+                var target = cmd.TryGetProperty("target_request_id", out var t)
+                    ? t.GetString() ?? "" : "";
+                StreamContext? ctx;
+                lock (_streamsLock) _activeStreams.TryGetValue(target, out ctx);
+                if (ctx is null)
+                    return ErrorResponse(requestId, "no active stream for target_request_id");
+                ctx.Cancel();
+                return Ok(requestId);
+            }
+
+            case "respond":
+            {
+                var target = cmd.TryGetProperty("target_request_id", out var t)
+                    ? t.GetString() ?? "" : "";
+                StreamContext? ctx;
+                lock (_streamsLock) _activeStreams.TryGetValue(target, out ctx);
+                if (ctx is null)
+                    return ErrorResponse(
+                        requestId, "no active awaiting_user stream for target_request_id");
+                var response = cmd.TryGetProperty("response", out var rv)
+                    ? JsonNode.Parse(rv.GetRawText()) as JsonObject ?? new JsonObject()
+                    : new JsonObject();
+                ctx.DeliverResponse(response);
+                return Ok(requestId);
+            }
+
             default:
-                // Delegate to user handler if registered.
+                // A legacy escape hatch, kept so existing plugins keep working.
                 if (OnManagementCommand is not null)
                 {
                     var result = await OnManagementCommand.Invoke(action, cmd);
                     if (result is not null) return result;
                 }
-                return ErrorResponse(requestId, $"unknown action: {action}");
+                return await DispatchActionAsync(action, requestId, cmd);
         }
     }
+
+    /// <summary>
+    /// Write a <c>set_config</c> payload.
+    /// </summary>
+    /// <remarks>
+    /// Core sends a string when the operator edited raw TOML, and an object when
+    /// the plugin declared a config schema and the UI rendered a form. It also
+    /// forwards the request body verbatim when that body has no top-level
+    /// <c>config</c> key, so the raw editor arrives as
+    /// <c>{"raw": "&lt;text&gt;"}</c>. Strings are written as-is; anything else
+    /// is <see cref="OnSetConfig"/>'s to handle, because turning an object into
+    /// TOML is not something this SDK can do — writing its JSON into a .toml
+    /// file, which is what it used to do, is not the same thing.
+    /// </remarks>
+    private async Task<JsonObject> HandleSetConfigAsync(JsonElement cmd, string requestId)
+    {
+        if (_mgmt?.ConfigPath is not { } path)
+            return ErrorResponse(requestId, "no config path configured");
+
+        if (!cmd.TryGetProperty("config", out var cfg))
+            return ErrorResponse(requestId, "missing 'config' field");
+
+        // Unwrap the raw-editor shape core forwards.
+        if (cfg.ValueKind == JsonValueKind.Object
+            && cfg.TryGetProperty("raw", out var raw)
+            && raw.ValueKind == JsonValueKind.String)
+        {
+            cfg = raw;
+        }
+
+        if (cfg.ValueKind != JsonValueKind.String)
+        {
+            if (OnSetConfig is not null && await OnSetConfig.Invoke(cfg))
+                return Ok(requestId);
+            return ErrorResponse(
+                requestId,
+                "structured config received; set OnSetConfig to accept it, "
+                + "or edit the raw form instead");
+        }
+
+        try
+        {
+            await File.WriteAllTextAsync(path, cfg.GetString()!);
+            return Ok(requestId);
+        }
+        catch (Exception ex)
+        {
+            return ErrorResponse(requestId, $"failed to write config: {ex.Message}");
+        }
+    }
+
+    /// <summary>Route a management command that is not a built-in to <see cref="OnAction"/>.</summary>
+    private async Task<JsonObject> DispatchActionAsync(
+        string action, string requestId, JsonElement cmd)
+    {
+        var declared = _mgmt?.Capabilities?.Actions.FirstOrDefault(a => a.Id == action);
+
+        // Params are everything that is not protocol envelope.
+        var paramsObj = new JsonObject();
+        foreach (var prop in cmd.EnumerateObject())
+        {
+            if (prop.Name is "action" or "request_id" or "target_request_id") continue;
+            paramsObj[prop.Name] = JsonNode.Parse(prop.Value.GetRawText());
+        }
+        var paramsElement = JsonDocument.Parse(paramsObj.ToJsonString()).RootElement;
+
+        if (declared is { Stream: true })
+            return StartStream(declared, requestId, paramsElement);
+
+        if (OnAction is null)
+            return ErrorResponse(requestId, $"unknown action: {action}");
+
+        try
+        {
+            var result = await OnAction.Invoke(action, paramsElement, null);
+            if (result is null)
+                return ErrorResponse(requestId, $"unknown action: {action}");
+            result["request_id"] = requestId;
+            result["status"] ??= "ok";
+            return result;
+        }
+        catch (Exception ex)
+        {
+            // A plugin bug must not take down the message loop.
+            _logger.LogWarning(ex, "Action {Action} threw", action);
+            return ErrorResponse(requestId, $"action failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>Run a streaming action and answer <c>accepted</c> straight away.</summary>
+    private JsonObject StartStream(PluginAction declared, string requestId, JsonElement @params)
+    {
+        if (string.IsNullOrEmpty(requestId))
+            return ErrorResponse("", "streaming action requires request_id");
+
+        if (declared.Concurrency == Concurrency.Single)
+        {
+            string? busy = null;
+            lock (_streamsLock)
+                busy = _activeStreams.FirstOrDefault(kv => kv.Value.ActionId == declared.Id).Key;
+            if (busy is not null)
+                return new JsonObject
+                {
+                    ["request_id"] = requestId,
+                    ["status"] = "busy",
+                    ["active_request_id"] = busy,
+                };
+        }
+
+        var ctx = new StreamContext(this, requestId, declared.Id);
+        lock (_streamsLock) _activeStreams[requestId] = ctx;
+
+        // Runs on its own task, so a slow action never stalls the message loop.
+        // Whatever happens, exactly one terminal stage must land and the
+        // retained topic must be cleared.
+        _ = Task.Run(async () =>
+        {
+            Exception? failure = null;
+            try
+            {
+                if (OnAction is not null)
+                    await OnAction.Invoke(declared.Id, @params, ctx);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Streaming action {Action} threw", declared.Id);
+                failure = ex;
+            }
+            finally
+            {
+                await ctx.FinalizeAsync(failure);
+                lock (_streamsLock) _activeStreams.Remove(requestId);
+            }
+        });
+
+        return new JsonObject
+        {
+            ["request_id"] = requestId,
+            ["status"] = "accepted",
+            ["stream_topic"] = ctx.Topic,
+        };
+    }
+
+    private static JsonObject Ok(string requestId) =>
+        new() { ["request_id"] = requestId, ["status"] = "ok" };
 
     private async Task HeartbeatLoopAsync(ManagementOptions options, CancellationToken ct)
     {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(options.HeartbeatIntervalSecs));
-        while (await timer.WaitForNextTickAsync(ct))
+        try
         {
-            var uptime = (long)(DateTime.UtcNow - _startedAt).TotalSeconds;
-            var payload = new JsonObject
-            {
-                ["timestamp"] = DateTime.UtcNow.ToString("o"),
-                ["version"] = options.Version,
-                ["uptime_secs"] = uptime,
-            };
-            await PublishAsync($"homecore/plugins/{PluginId}/heartbeat", payload, retain: false);
+            while (await timer.WaitForNextTickAsync(ct))
+                await PublishHeartbeatAsync();
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutting down.
         }
     }
+
+    /// <summary>Publish one heartbeat now.</summary>
+    internal async Task PublishHeartbeatAsync()
+    {
+        if (_mgmt is null) return;
+        int deviceCount;
+        lock (_devicesLock) deviceCount = _devices.Count;
+
+        var payload = new JsonObject
+        {
+            ["timestamp"] = DateTime.UtcNow.ToString("o"),
+            ["version"] = _mgmt.Version,
+            ["sdk_version"] = SdkVersion,
+            ["protocol_version"] = ProtocolVersion,
+            ["uptime_secs"] = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
+            ["device_count"] = deviceCount,
+            // Full current set every beat. Core replaces rather than merges, so
+            // a cleared condition disappears on its own and nothing expires.
+            ["notices"] = Notices.ToWire(),
+        };
+        await PublishAsync($"homecore/plugins/{PluginId}/heartbeat", payload, retain: false);
+    }
+
+    /// <summary>
+    /// Publish the action manifest, retained.
+    /// </summary>
+    /// <remarks>
+    /// Retained because homeCore may start, or restart, after this plugin —
+    /// otherwise a late-joining core never learns the plugin has actions.
+    /// </remarks>
+    private async Task PublishCapabilitiesAsync()
+    {
+        if (_mgmt?.Capabilities is not { } caps) return;
+        caps.PluginId = PluginId;
+        await PublishRawInternalAsync(
+            $"homecore/plugins/{PluginId}/capabilities",
+            caps.ToJson().ToJsonString(),
+            retain: true);
+    }
+
+    /// <summary>Publish a raw payload. Used by <see cref="StreamContext"/>.</summary>
+    internal Task PublishRawInternalAsync(string topic, string payload, bool retain) =>
+        PublishRawAsync(topic, payload, retain);
 
     // ── Internal: Publish Helpers ─────────────────────────────────────────
 

@@ -4,7 +4,7 @@
     <TargetFramework>net8.0</TargetFramework>
     <RootNamespace>HomeCore.PluginSdk</RootNamespace>
     <AssemblyName>HomeCore.PluginSdk</AssemblyName>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>homeCore Contributors</Authors>
     <Description>Plugin SDK for building HomeCore device plugins in .NET</Description>
     <PackageId>HomeCore.PluginSdk</PackageId>
@@ -12,6 +12,15 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The default glob would compile tests/ and examples/ into the library
+         itself, because they live under the project directory. -->
+    <Compile Remove="tests/**" />
+    <Compile Remove="examples/**" />
+    <None Remove="tests/**" />
+    <None Remove="examples/**" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="MQTTnet" Version="4.*" />
