@@ -5,17 +5,23 @@
 ## Quick start
 
 ```csharp
-using HomeCoreSdk;
+using HomeCore.PluginSdk;
 
 var client = new PluginClient(new PluginOptions { PluginId = "plugin.example" });
 
-client.OnCommand += async (deviceId, payload) => {
+client.OnCommand += (deviceId, payload) => {
     Console.WriteLine($"Command for {deviceId}: {payload}");
 };
 
 await client.ConnectAsync();
-await client.RegisterDeviceFull("example_sensor", "Example Sensor", deviceType: "sensor");
-await client.PublishState("example_sensor", new { temperature = 21.5 });
+await client.RegisterDeviceFullAsync("example_sensor", "Example Sensor", deviceType: "sensor");
+
+// Registration and command subscription are separate: without this the device
+// appears in homeCore and silently ignores every command.
+await client.SubscribeCommandsAsync("example_sensor");
+
+await client.PublishStateAsync("example_sensor", new { temperature = 21.5 });
+await client.PublishAvailabilityAsync("example_sensor", true);
 await client.RunAsync();
 ```
 
