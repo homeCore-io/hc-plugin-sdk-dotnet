@@ -284,6 +284,8 @@ the change, so the UI and the audit log can say so.
 | Member | Purpose |
 |---|---|
 | `EnableManagementAsync(ManagementOptions)` | Heartbeat, remote management, action manifest |
+| `EnableLogForwarding(minLevel)` | Send your logs to homeCore's live log stream |
+| `ForwardLogAsync(level, message, target:, fields:)` | Forward one line directly |
 | `PublishPluginStatusAsync(status)` | active / degraded / offline |
 | `PublishEventAsync(type, payload)` | A structured event on the bus |
 | `Notices` | `.Raise()`, `.Clear()`, `.Set()`, `.Snapshot()` |
@@ -299,14 +301,69 @@ the change, so the UI and the audit log can say so.
 | `OnSetConfig` | A structured config write |
 | `OnManagementCommand` | Legacy escape hatch, tried before `OnAction` |
 
+## Log forwarding
+
+Send this plugin's logs to homeCore's live log stream, so they appear alongside
+core's own instead of only in the plugin's stdout. Register the provider on any
+logging builder and everything the plugin logs is forwarded:
+
+```csharp
+client.EnableLogForwarding(LogLevel.Information);
+
+using var factory = LoggerFactory.Create(b =>
+{
+    b.AddConsole();
+    b.AddHomeCore(client, LogLevel.Information);
+});
+var log = factory.CreateLogger("mylight.bridge");
+
+log.LogInformation("connected to {Host}", host);
+```
+
+Forwarding is **off until you enable it** — linking this SDK does not start
+shipping your logs to a topic anything can subscribe to. An operator can raise
+or lower the forwarded level at runtime from the UI (`set_log_level`); that
+affects forwarding only, not your own console or file sinks.
+
+`ForwardLogAsync` is the direct route for code with no `ILogger` to hand.
+
+### Secrets
+
+The log topic is one anything can subscribe to, so fields whose **names** look
+secret — anything containing `password`, `secret`, `token`, `key`, `psk`,
+`passcode`, `credential`, or `auth` — are published as `<redacted>`.
+
+**.NET needs more care here than Rust does.** In Rust,
+`tracing::info!(api_key = %k, "connecting")` keeps the value out of the message
+text, so redacting the field is enough. .NET's structured logging renders every
+template argument *into* the message, so this:
+
+```csharp
+log.LogInformation("connecting with {ApiKey}", key);
+```
+
+would publish the key in the message even with the field masked. Masking that
+looks like protection but is not, so the SDK also removes the values of
+secret-named fields from the rendered message.
+
+That is a backstop, not a licence. A secret you interpolate yourself —
+`log.LogInformation($"connecting with {key}")` — has no field name to be
+recognised by, and nothing can find it. Values shorter than six characters are
+left alone, because replacing every `"1"` in a sentence would turn the line into
+nonsense.
+
+The honest rule stays: do not log secrets.
+
 ## Parity with the Rust SDK
 
 Everything the Rust SDK does is here: registration, state, availability, the
-management protocol, notices, capability actions including streaming, and
-cross-device state subscription.
+management protocol, notices, capability actions including streaming,
+cross-device state subscription, and log forwarding.
 
-Not here: log forwarding to homeCore's live log stream, and device persistence
-/ `reconcile_devices`.
+Not here: device persistence / `reconcile_devices`, the Rust SDK's helper for
+unregistering devices that disappeared from your upstream while the plugin was
+down. That is the only remaining gap, and it is the same one in the Python and
+Node.js SDKs.
 
 ## Development
 

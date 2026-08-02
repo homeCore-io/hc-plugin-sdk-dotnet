@@ -136,6 +136,9 @@ public sealed class PluginClient : IAsyncDisposable
     private readonly Dictionary<string, StreamContext> _activeStreams = new();
     private readonly object _streamsLock = new();
 
+    private bool _logForwardEnabled;
+    private LogLevel _logForwardMinLevel = LogLevel.Information;
+
     /// <summary>This SDK's version, reported in every heartbeat.</summary>
     public const string SdkVersion = "0.2.0";
 
@@ -611,14 +614,20 @@ public sealed class PluginClient : IAsyncDisposable
                 return await HandleSetConfigAsync(cmd, requestId);
 
             case "set_log_level":
+            {
                 var level = cmd.TryGetProperty("level", out var lv) ? lv.GetString() ?? "info" : "info";
-                _logger.LogInformation("Management: log level change requested to {Level}", level);
+                // Applies to forwarding immediately. It cannot reach into the
+                // host's own ILoggerFactory, so a plugin that also logs to
+                // stdout keeps whatever level it was configured with there.
+                _logForwardMinLevel = LogForwarding.ParseLevel(level);
+                _logger.LogInformation("Management: forward log level set to {Level}", level);
                 return new JsonObject
                 {
                     ["request_id"] = requestId,
                     ["status"] = "ok",
-                    ["note"] = "log level change acknowledged",
+                    ["note"] = "forwarding level changed; the plugin's own sinks are unaffected",
                 };
+            }
 
             case "cancel":
             {
@@ -856,6 +865,85 @@ public sealed class PluginClient : IAsyncDisposable
             caps.ToJson().ToJsonString(),
             retain: true);
     }
+
+    // ── Log forwarding ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Publish one log line to homeCore's live log stream.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Usually you do not call this: register
+    /// <see cref="MqttLoggerProvider"/> on your logging builder
+    /// (<c>builder.AddHomeCore(client)</c>) and everything the plugin logs is
+    /// forwarded. This is the direct route for code that has no
+    /// <see cref="ILogger"/> to hand.
+    /// </para>
+    /// <para>
+    /// QoS 0 and not retained: logs are a stream, and a reconnecting plugin
+    /// should not replay its last line as though it were new. Publishing is
+    /// best-effort — a logging call must never throw or block, so a broker
+    /// error is swallowed rather than surfaced.
+    /// </para>
+    /// <para>
+    /// Field names that look secret are redacted; the message string is
+    /// published as-is. Pass secrets as fields, not interpolated into the text.
+    /// </para>
+    /// </remarks>
+    public async Task ForwardLogAsync(
+        string level,
+        string message,
+        string? target = null,
+        JsonObject? fields = null)
+    {
+        if (!_logForwardEnabled) return;
+        if (LogForwarding.ParseLevel(level) < _logForwardMinLevel) return;
+        if (!_mqtt.IsConnected) return;
+
+        var line = new JsonObject
+        {
+            ["timestamp"] = DateTime.UtcNow.ToString("o"),
+            ["level"] = level,
+            ["target"] = target ?? PluginId,
+            ["message"] = message,
+        };
+        // `fields` is skipped when null on the core side, so omit rather than
+        // send an empty object.
+        if (fields is not null) line["fields"] = fields;
+
+        try
+        {
+            var msg = new MqttApplicationMessageBuilder()
+                .WithTopic($"homecore/plugins/{PluginId}/logs")
+                .WithPayload(Encoding.UTF8.GetBytes(line.ToJsonString()))
+                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtMostOnce)
+                .WithRetainFlag(false)
+                .Build();
+            await _mqtt.PublishAsync(msg);
+        }
+        catch
+        {
+            // Never let logging take down the caller.
+        }
+    }
+
+    /// <summary>
+    /// Turn on log forwarding and set the minimum level.
+    /// </summary>
+    /// <remarks>
+    /// Off until called, so a plugin does not start shipping logs to the broker
+    /// merely by linking this SDK. The level is also what
+    /// <c>set_log_level</c> adjusts at runtime, so an operator can turn a
+    /// misbehaving plugin up to debug from the UI without restarting it.
+    /// </remarks>
+    public void EnableLogForwarding(LogLevel minLevel = LogLevel.Information)
+    {
+        _logForwardEnabled = true;
+        _logForwardMinLevel = minLevel;
+    }
+
+    /// <summary>The level below which lines are not forwarded.</summary>
+    public LogLevel LogForwardMinLevel => _logForwardMinLevel;
 
     /// <summary>Publish a raw payload. Used by <see cref="StreamContext"/>.</summary>
     internal Task PublishRawInternalAsync(string topic, string payload, bool retain) =>
