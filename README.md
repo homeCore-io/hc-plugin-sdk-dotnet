@@ -289,6 +289,8 @@ the change, so the UI and the audit log can say so.
 | `PublishPluginStatusAsync(status)` | active / degraded / offline |
 | `PublishEventAsync(type, payload)` | A structured event on the bus |
 | `Notices` | `.Raise()`, `.Clear()`, `.Set()`, `.Snapshot()` |
+| `EnableDevicePersistence(path)` | Remember registered devices across restarts |
+| `ReconcileDevicesAsync(live)` | Unregister everything not in the live set |
 
 ### Events and handlers
 
@@ -354,16 +356,56 @@ nonsense.
 
 The honest rule stays: do not log secrets.
 
+## Device persistence
+
+When a device disappears from your upstream — a bulb deleted from the bridge, a
+Z-Wave node excluded, an entry removed from config — its homeCore record has to
+go too. Otherwise it lingers forever, still shown in the UI and still accepting
+commands nothing will execute.
+
+Knowing what disappeared means knowing what existed *before*, and a plugin that
+has just restarted knows nothing. So the SDK can mirror every
+register/unregister to a small JSON file:
+
+```csharp
+// Once, at startup, before registering anything.
+client.EnableDevicePersistence(Path.Combine(configDir, ".published-device-ids.json"));
+```
+
+Then, after a sync where you know the full live set:
+
+```csharp
+var report = await client.ReconcileDevicesAsync(bridge.Devices().Select(d => d.Id));
+// report.StaleUnregistered — gone upstream, now gone from homeCore
+// report.UnknownInLive     — ids you passed but never registered
+```
+
+Devices registered in *earlier runs* are retired too, which is the point: a
+fresh process that has registered nothing can still clean up what the previous
+one left behind.
+
+The plugin id is inserted into the filename
+(`.published-device-ids.plugin.hue.json`), because real deployments keep every
+plugin's config in one directory and every plugin derives this path the same
+way — unscoped, they would share one file and retire each other's devices.
+
+**Only reconcile after a sync you trust.** On a partial fetch this unregisters
+live devices behind a temporarily unreachable upstream — which looks exactly
+like the bug it exists to prevent, except the devices were fine. Track an
+"everything succeeded" flag across your per-source loop and pass the live set
+only when it holds.
+
+Plugins whose upstream reports irregularly — battery sensors that go quiet for
+hours — should enable persistence but skip auto-reconcile. An operator can clear
+zombies with `DELETE /api/v1/plugins/{id}/devices`.
+
 ## Parity with the Rust SDK
 
 Everything the Rust SDK does is here: registration, state, availability, the
 management protocol, notices, capability actions including streaming,
 cross-device state subscription, and log forwarding.
 
-Not here: device persistence / `reconcile_devices`, the Rust SDK's helper for
-unregistering devices that disappeared from your upstream while the plugin was
-down. That is the only remaining gap, and it is the same one in the Python and
-Node.js SDKs.
+Everything the Rust SDK does is here. There is no gap left.
 
 ## Development
 
