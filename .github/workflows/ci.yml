@@ -1,0 +1,35 @@
+# CI for the .NET plugin SDK.
+#
+# Build only: this repo has no test project, so there is nothing to run yet.
+# That is still worth doing — the SDK is one source file and a csproj that
+# nothing has ever compiled in CI, so a change that does not build could be
+# committed and nobody would know until someone tried to use it.
+#
+# `-warnaserror` because the project sets `<Nullable>enable</Nullable>`, and a
+# nullability warning in an SDK is a bug in someone else's code later.
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          # Matches <TargetFramework>net8.0</TargetFramework>.
+          dotnet-version: "8.0.x"
+
+      - run: dotnet restore
+
+      - run: dotnet build --no-restore --configuration Release -warnaserror
