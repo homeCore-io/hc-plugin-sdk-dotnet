@@ -8,15 +8,34 @@ Create a `PluginClient`, say what your devices are, handle commands. The SDK
 covers the MQTT connection, registration, the management protocol, notices, and
 capability actions.
 
+## Installing
+
 Targets **net8.0**, so it runs on .NET 8 and later.
 
-Not on NuGet yet, and NuGet has no git-install equivalent, so reference the
-project directly:
+### Working inside the homeCore workspace
+
+This is the normal case today. If you cloned the whole workspace — `core/`,
+`plugins/`, `sdks/` side by side — install from the checkout. Your plugin then
+picks up SDK edits with no commit, tag, or reinstall in between, which is what
+you want while developing the two together.
+
+```bash
+# from your plugin's directory, e.g. plugins/hc-mything/
+dotnet add reference ../../sdks/hc-plugin-sdk-dotnet/HomeCoreSdk.csproj
+```
+
+A project reference builds the SDK from source as part of your build, so an
+edit in `sdks/hc-plugin-sdk-dotnet` takes effect on the next `dotnet build`.
+
+### From a release
 
 ```bash
 git clone --branch v0.2.0 https://github.com/homeCore-io/hc-plugin-sdk-dotnet
 dotnet add reference ../hc-plugin-sdk-dotnet/HomeCoreSdk.csproj
 ```
+
+**Nothing is published to NuGet**, and NuGet has no git-install equivalent, so
+the release route is a clone at the tag plus a project reference.
 
 ## Your first plugin
 
