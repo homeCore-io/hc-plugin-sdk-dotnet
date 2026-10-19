@@ -140,6 +140,11 @@ public sealed class PluginClient : IAsyncDisposable
     // The alerts last set, by topic, said again on every connect.
     private readonly AlertTracker _alerts = new();
 
+    // The plugin's own screens, when it carries them: what the manifest
+    // declares, and the folder the files are served from.
+    private PluginUi? _ui;
+    private string? _uiDir;
+
     // Tests capture publishes here rather than needing a broker.
     internal Func<string, string, bool, Task>? PublishSink { get; set; }
 
@@ -147,7 +152,7 @@ public sealed class PluginClient : IAsyncDisposable
     private LogLevel _logForwardMinLevel = LogLevel.Information;
 
     /// <summary>This SDK's version, reported in every heartbeat.</summary>
-    public const string SdkVersion = "0.3.0";
+    public const string SdkVersion = "0.4.0";
 
     /// <summary>
     /// The wire protocol this SDK speaks, which is core's hc-types version.
@@ -600,6 +605,38 @@ public sealed class PluginClient : IAsyncDisposable
             options.HeartbeatIntervalSecs);
     }
 
+    /// <summary>
+    /// Carry and serve the plugin's own screens: the built UI folder
+    /// <paramref name="dir"/> (its <c>manifest.json</c> says where each
+    /// component goes). They are declared on the manifest under
+    /// <paramref name="version"/> — the plugin's — with a hash of the files as
+    /// their <c>build</c>, and served from <paramref name="dir"/> when homeCore
+    /// asks; homeCore passes them through to the app and keeps none.
+    /// </summary>
+    /// <remarks>
+    /// A folder that isn't there, or offers nothing, is said in the log and
+    /// skipped — the app then shows its generic screens. Call it before
+    /// <see cref="EnableManagementAsync"/>:
+    /// <code>
+    /// if (Ui.FindDir() is { } dir) client.WithUiDir(dir, "1.2.0");
+    /// </code>
+    /// </remarks>
+    public PluginClient WithUiDir(string dir, string version)
+    {
+        try
+        {
+            var ui = Ui.Load(dir, version);
+            _logger.LogInformation("Serving the plugin's own UI from {Dir} (build {Build})", dir, ui.Build);
+            _ui = ui;
+            _uiDir = dir;
+        }
+        catch (UiException ex)
+        {
+            _logger.LogWarning("No plugin UI offered ({Dir}): {Error}", dir, ex.Message);
+        }
+        return this;
+    }
+
     // ── Event Loop ────────────────────────────────────────────────────────
 
     /// <summary>
@@ -728,6 +765,9 @@ public sealed class PluginClient : IAsyncDisposable
                     ["request_id"] = requestId,
                     ["status"] = "ok",
                 };
+
+            case "ui_file":
+                return HandleUiFile(cmd, requestId);
 
             case "get_config":
                 if (_mgmt?.ConfigPath is { } path)
@@ -996,12 +1036,58 @@ public sealed class PluginClient : IAsyncDisposable
     /// </remarks>
     private async Task PublishCapabilitiesAsync()
     {
-        if (_mgmt?.Capabilities is not { } caps) return;
-        caps.PluginId = PluginId;
+        if (BuildManifest() is not { } manifest) return;
         await PublishRawInternalAsync(
             $"homecore/plugins/{PluginId}/capabilities",
-            caps.ToJson().ToJsonString(),
+            manifest.ToJsonString(),
             retain: true);
+    }
+
+    /// <summary>
+    /// The capability manifest, or <c>null</c> when there is nothing to
+    /// declare. A plugin with screens but no actions still needs one: the
+    /// <c>ui</c> rides on it.
+    /// </summary>
+    internal JsonObject? BuildManifest()
+    {
+        if (_mgmt is null) return null;
+        var caps = _mgmt.Capabilities;
+        if (caps is null && _ui is null) return null;
+        caps ??= new Capabilities();
+        caps.PluginId = PluginId;
+        var manifest = caps.ToJson();
+        if (_ui is not null) manifest["ui"] = _ui.ToJson();
+        return manifest;
+    }
+
+    /// <summary>A piece of one of the UI's files, for homeCore to pass on.</summary>
+    private JsonObject HandleUiFile(JsonElement cmd, string requestId)
+    {
+        if (_uiDir is null)
+            return ErrorResponse(requestId, "no such file: this plugin serves no UI");
+        // As serde_json's as_u64 reads them for the Rust SDK.
+        static ulong? U64(JsonElement c, string key) =>
+            c.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number
+                && v.TryGetUInt64(out var n) ? n : null;
+        var file = cmd.TryGetProperty("file", out var f) && f.ValueKind == JsonValueKind.String
+            ? f.GetString()! : "";
+        var offset = U64(cmd, "offset") ?? 0;
+        var max = (int)Math.Clamp(U64(cmd, "max") ?? 128 * 1024, 1UL, 160 * 1024);
+        try
+        {
+            var (data, done) = Ui.Piece(_uiDir, file, offset, max);
+            return new JsonObject
+            {
+                ["request_id"] = requestId,
+                ["status"] = "ok",
+                ["data"] = Convert.ToBase64String(data),
+                ["done"] = done,
+            };
+        }
+        catch (UiException ex)
+        {
+            return ErrorResponse(requestId, ex.Message);
+        }
     }
 
     // ── Log forwarding ────────────────────────────────────────────────────
