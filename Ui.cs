@@ -29,19 +29,31 @@ public sealed class UiException : Exception
 
 /// <summary>One place in the app a plugin's component fills.</summary>
 /// <param name="Slot">
-/// <c>plugin.page</c> (its page, in place of the generic action list) or
-/// <c>device.panel</c> (its devices' panel, in place of the generic controls).
+/// The place: <c>plugin.page</c>, <c>device.panel</c>, <c>device.card</c>,
+/// <c>dashboard.card</c>, … — which slots exist is homeCore's to say, so this
+/// SDK passes any through.
 /// </param>
 /// <param name="Element">The custom element the module defines for it.</param>
 /// <param name="DeviceTypes">
-/// For <c>device.panel</c>: only devices of these types; every one of the
-/// plugin's devices when empty.
+/// For a device slot: only devices of these types; every one of the plugin's
+/// devices when empty.
 /// </param>
-public sealed record UiSlot(string Slot, string Element, IReadOnlyList<string>? DeviceTypes = null)
+/// <param name="Extra">
+/// Every other key the manifest gave the slot (<c>label</c>,
+/// <c>description</c>, <c>forms</c>, <c>settings</c>, and whatever a newer
+/// homeCore adds), passed on to homeCore as declared.
+/// </param>
+public sealed record UiSlot(
+    string Slot,
+    string Element,
+    IReadOnlyList<string>? DeviceTypes = null,
+    JsonObject? Extra = null)
 {
     public JsonObject ToJson()
     {
-        var o = new JsonObject { ["slot"] = Slot, ["element"] = Element };
+        var o = Extra?.DeepClone().AsObject() ?? new JsonObject();
+        o["slot"] = Slot;
+        o["element"] = Element;
         if (DeviceTypes is { Count: > 0 })
         {
             var types = new JsonArray();
@@ -80,27 +92,6 @@ public sealed record PluginUi
         o["slots"] = slots;
         return o;
     }
-
-    /// <summary>
-    /// Whether it can be offered at all: a version, a module inside the folder,
-    /// and at least one slot the app knows, each naming a valid custom element.
-    /// Slots that don't pass are dropped; <c>null</c> when none is left.
-    /// </summary>
-    public PluginUi? Validated()
-    {
-        if (Version.Trim().Length == 0
-            || !Ui.RelativePath(Entry)
-            || !Build.All(c => c is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or >= '0' and <= '9'))
-            return null;
-        var slots = Slots.Where(s => Ui.Slots.Contains(s.Slot) && CustomElement(s.Element)).ToList();
-        return slots.Count == 0 ? null : this with { Slots = slots };
-    }
-
-    /// <summary>A custom element name: lowercase, starting with a letter, with a hyphen.</summary>
-    private static bool CustomElement(string name) =>
-        name.Contains('-')
-        && name.Length > 0 && name[0] is >= 'a' and <= 'z'
-        && name.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '-' or '.' or '_');
 }
 
 /// <summary>Finding, reading and serving a plugin's UI folder.</summary>
@@ -108,9 +99,6 @@ public static class Ui
 {
     /// <summary>The version of the app's <c>host</c> interface a UI is built against.</summary>
     public const uint HostApi = 1;
-
-    /// <summary>The slots the app knows.</summary>
-    public static readonly IReadOnlyList<string> Slots = new[] { "plugin.page", "device.panel" };
 
     /// <summary>
     /// Where a plugin's UI folder is. In order:
@@ -184,6 +172,14 @@ public static class Ui
 
         if (!File.Exists(Path.Combine(dir, entry)))
             throw new UiException($"its entry {entry} isn't there");
+        // Which slots exist is homeCore's to say, not this SDK's: an SDK older
+        // than a slot would otherwise keep a plugin from ever offering it. Only
+        // what is wrong whatever the slot is refused here; every slot goes on
+        // as declared.
+        if (slots.Count == 0)
+            throw new UiException("it declares nowhere the app can put it");
+        if (version.Trim().Length == 0 || !RelativePath(entry))
+            throw new UiException("its version or entry isn't usable");
         return new PluginUi
         {
             HostApi = hostApi,
@@ -191,7 +187,7 @@ public static class Ui
             Build = BuildOf(dir),
             Entry = entry,
             Slots = slots,
-        }.Validated() ?? throw new UiException("it declares nowhere the app can put it");
+        };
     }
 
     private static UiSlot SlotFrom(JsonElement v)
@@ -209,7 +205,13 @@ public static class Ui
                 throw new UiException("manifest.json: `device_types` must be a list of strings");
             types.AddRange(t.EnumerateArray().Select(x => x.GetString()!));
         }
-        return new UiSlot(slot.GetString()!, element.GetString()!, types);
+        var extra = new JsonObject();
+        foreach (var p in v.EnumerateObject())
+        {
+            if (p.Name is "slot" or "element" or "device_types") continue;
+            extra[p.Name] = JsonNode.Parse(p.Value.GetRawText());
+        }
+        return new UiSlot(slot.GetString()!, element.GetString()!, types, extra);
     }
 
     /// <summary>
