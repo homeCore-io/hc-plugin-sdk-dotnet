@@ -152,7 +152,7 @@ public sealed class PluginClient : IAsyncDisposable
     private LogLevel _logForwardMinLevel = LogLevel.Information;
 
     /// <summary>This SDK's version, reported in every heartbeat.</summary>
-    public const string SdkVersion = "0.4.0";
+    public const string SdkVersion = "0.4.1";
 
     /// <summary>
     /// The wire protocol this SDK speaks, which is core's hc-types version.

@@ -85,33 +85,40 @@ public class UiTests : IDisposable
         Assert.Contains("nowhere", Assert.Throws<UiException>(() => Ui.Load(_tmp, "1")).Message);
     }
 
+    /// <summary>
+    /// Which slots exist is homeCore's to say: an SDK that dropped the ones it
+    /// doesn't know would keep a plugin from ever offering a newer one.
+    /// </summary>
     [Fact]
-    public void AUiKeepsTheSlotsTheAppKnowsAndDropsTheRest()
+    public void EverySlotIsPassedOnAsDeclaredUnknownOnesAndFieldsIncluded()
     {
-        var ui = new PluginUi
-        {
-            HostApi = 1,
-            Version = "0.1.18",
-            Slots = new[]
-            {
-                new UiSlot("plugin.page", "hc-ecowitt-page"),
-                new UiSlot("device.panel", "hc-ecowitt-station", new[] { "weather_station" }),
-                new UiSlot("dashboard.card", "hc-ecowitt-card"),
-                new UiSlot("plugin.page", "NoHyphen"),
-            },
-        }.Validated();
-        Assert.NotNull(ui);
-        Assert.Equal(2, ui!.Slots.Count);
-        Assert.Equal(new[] { "weather_station" }, ui.Slots[1].DeviceTypes);
+        const string slots = """
+            [{"slot":"future.slot","element":"hc-x-later"},
+             {"slot":"dashboard.card","element":"hc-x-card","label":"Quick presets",
+              "description":"One tap to a preset","forms":["compact","large"],
+              "settings":"hc-x-card-settings","someday":{"nested":true}},
+             {"slot":"device.panel","element":"hc-x-panel","device_types":["light"]},
+             {"slot":"plugin.page","element":"NoHyphen"}]
+            """;
+        File.WriteAllText(Path.Combine(_tmp, "manifest.json"), $$"""{"host_api":1,"slots":{{slots}}}""");
+        File.WriteAllText(Path.Combine(_tmp, "index.js"), "export {}");
+        var got = Ui.Load(_tmp, "1.0.0").ToJson()["slots"];
+        Assert.True(JsonNode.DeepEquals(JsonNode.Parse(slots), got), got!.ToJsonString());
+    }
 
-        var page = new[] { new UiSlot("plugin.page", "hc-x-page") };
-        PluginUi? Make(string entry, string version = "1.0.0", UiSlot[]? slots = null) =>
-            new PluginUi { HostApi = 1, Version = version, Entry = entry, Slots = slots ?? page }.Validated();
-        Assert.NotNull(Make("index.js"));
-        Assert.Null(Make("../index.js"));
-        Assert.Null(Make("/etc/index.js"));
-        Assert.Null(Make("index.js", " "));
-        Assert.Null(Make("index.js", "1.0.0", Array.Empty<UiSlot>()));
+    [Fact]
+    public void AnUnusableVersionOrEntryOffersNothing()
+    {
+        var d = Folder();
+        Assert.Contains("version or entry", Assert.Throws<UiException>(() => Ui.Load(d, " ")).Message);
+        File.WriteAllText(Path.Combine(d, "manifest.json"),
+            """{"host_api":1,"entry":"./index.js","slots":[{"slot":"plugin.page","element":"hc-x-page"}]}""");
+        Assert.Equal("./index.js", Ui.Load(d, "1").Entry);
+        var sub = Path.Combine(d, "sub");
+        Directory.CreateDirectory(sub);
+        File.WriteAllText(Path.Combine(sub, "manifest.json"),
+            """{"host_api":1,"entry":"../index.js","slots":[{"slot":"plugin.page","element":"hc-x-page"}]}""");
+        Assert.Contains("version or entry", Assert.Throws<UiException>(() => Ui.Load(sub, "1")).Message);
     }
 
     [Fact]

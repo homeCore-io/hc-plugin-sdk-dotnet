@@ -4,7 +4,7 @@
     <TargetFramework>net8.0</TargetFramework>
     <RootNamespace>HomeCore.PluginSdk</RootNamespace>
     <AssemblyName>HomeCore.PluginSdk</AssemblyName>
-    <Version>0.4.0</Version>
+    <Version>0.4.1</Version>
     <Authors>homeCore Contributors</Authors>
     <Description>Plugin SDK for building HomeCore device plugins in .NET</Description>
     <PackageId>HomeCore.PluginSdk</PackageId>
