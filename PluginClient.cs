@@ -137,11 +137,17 @@ public sealed class PluginClient : IAsyncDisposable
     private readonly Dictionary<string, StreamContext> _activeStreams = new();
     private readonly object _streamsLock = new();
 
+    // The alerts last set, by topic, said again on every connect.
+    private readonly AlertTracker _alerts = new();
+
+    // Tests capture publishes here rather than needing a broker.
+    internal Func<string, string, bool, Task>? PublishSink { get; set; }
+
     private bool _logForwardEnabled;
     private LogLevel _logForwardMinLevel = LogLevel.Information;
 
     /// <summary>This SDK's version, reported in every heartbeat.</summary>
-    public const string SdkVersion = "0.2.0";
+    public const string SdkVersion = "0.3.0";
 
     /// <summary>
     /// The wire protocol this SDK speaks, which is core's hc-types version.
@@ -231,6 +237,9 @@ public sealed class PluginClient : IAsyncDisposable
         foreach (var deviceId in known)
             await SubscribeCommandsAsync(deviceId);
 
+        // Say the alerts again: a restarted core's broker has forgotten them.
+        await RepublishAlertsAsync();
+
         if (_mgmt is not null)
         {
             await _mqtt.SubscribeAsync(
@@ -292,6 +301,54 @@ public sealed class PluginClient : IAsyncDisposable
     /// <summary>Publish plugin status: "active", "degraded", or "offline" (retained).</summary>
     public Task PublishPluginStatusAsync(string status) =>
         PublishRawAsync($"homecore/plugins/{PluginId}/status", status, retain: true);
+
+    // ── Alerts ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Say which of the plugin's alerts are true of a device now — the whole
+    /// list; an empty one clears them. Each names a kind declared in
+    /// <see cref="Capabilities.AlertKinds"/>; homeCore decides whether it is
+    /// shown and where it is sent.
+    /// </summary>
+    /// <remarks>
+    /// Retained, and said again on every reconnect, so set it when something
+    /// changes, not on a timer. Set while disconnected, it is held and
+    /// published on the next connect.
+    /// </remarks>
+    public Task SetAlertsAsync(string deviceId, IEnumerable<PluginAlert> alerts) =>
+        PublishAlertsAsync($"homecore/devices/{deviceId}/alerts", alerts);
+
+    /// <summary>
+    /// The same as <see cref="SetAlertsAsync"/> for the plugin's alerts about
+    /// itself — a login that expired, a bridge that needs its button pressed.
+    /// </summary>
+    public Task SetPluginAlertsAsync(IEnumerable<PluginAlert> alerts) =>
+        PublishAlertsAsync($"homecore/plugins/{PluginId}/alerts", alerts);
+
+    private async Task PublishAlertsAsync(string topic, IEnumerable<PluginAlert> alerts)
+    {
+        var payload = AlertWire.Serialize(alerts);
+        _alerts.Hold(topic, payload);
+        if (PublishSink is null && !_mqtt.IsConnected) return; // said on connect
+        await PublishRawAsync(topic, payload, retain: true);
+        _alerts.Delivered(topic, payload);
+    }
+
+    private async Task RepublishAlertsAsync()
+    {
+        foreach (var (topic, payload) in _alerts.Snapshot())
+        {
+            try
+            {
+                await PublishRawAsync(topic, payload, retain: true);
+                _alerts.Delivered(topic, payload);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to republish alerts on {Topic}", topic);
+            }
+        }
+    }
 
     // ── Events ────────────────────────────────────────────────────────────
 
@@ -1040,6 +1097,11 @@ public sealed class PluginClient : IAsyncDisposable
 
     private async Task PublishRawAsync(string topic, string payload, bool retain)
     {
+        if (PublishSink is not null)
+        {
+            await PublishSink(topic, payload, retain);
+            return;
+        }
         var msg = new MqttApplicationMessageBuilder()
             .WithTopic(topic)
             .WithPayload(Encoding.UTF8.GetBytes(payload))

@@ -173,6 +173,14 @@ public sealed class Capabilities
     /// </summary>
     public JsonNode? ConfigDescriptor { get; init; }
 
+    /// <summary>
+    /// The kinds of alert the plugin can raise. Ride on the manifest as
+    /// <c>alert_kinds</c>, so the settings screen can list each — and let
+    /// someone turn it on or off — before it ever happens. Raise them with
+    /// <see cref="PluginClient.SetAlertsAsync"/>.
+    /// </summary>
+    public IReadOnlyList<PluginAlertKind> AlertKinds { get; init; } = Array.Empty<PluginAlertKind>();
+
     internal string PluginId { get; set; } = "";
 
     public JsonObject ToJson()
@@ -188,6 +196,12 @@ public sealed class Capabilities
         };
         // These ride on the manifest rather than a topic of their own; core
         // extracts them from this payload.
+        if (AlertKinds.Count > 0)
+        {
+            var kinds = new JsonArray();
+            foreach (var k in AlertKinds) kinds.Add(k.ToJson());
+            o["alert_kinds"] = kinds;
+        }
         if (ConfigSchema is not null) o["config_schema"] = ConfigSchema.DeepClone();
         if (ConfigDescriptor is not null) o["config_descriptor"] = ConfigDescriptor.DeepClone();
         return o;
