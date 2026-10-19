@@ -338,6 +338,38 @@ client.OnSetConfig = async config =>
 };
 ```
 
+## Your own screens
+
+A plugin can carry web components — a page for itself, a panel for its devices
+— and serve them itself. Build them into a folder with one ES module and a
+`manifest.json` saying where each goes, ship the folder beside the program as
+`ui/` (copy it to the output directory), and, before enabling management:
+
+```csharp
+if (Ui.FindDir() is { } dir)
+    client.WithUiDir(dir, "1.2.0");
+await client.EnableManagementAsync(new ManagementOptions { Version = "1.2.0" });
+```
+
+`Ui.FindDir(projectDir)` looks, in order, at `HC_PLUGIN_UI_DIR`; `ui/` beside
+the program (`AppContext.BaseDirectory`, how a package installs it); and, run
+from a source checkout, `<project>/ui/dist` — `projectDir` when given, else the
+nearest folder above the program holding a `.csproj`. Apart from the
+environment variable, a folder counts only if it holds `manifest.json`.
+
+The SDK declares them on the manifest (`ui`, with a hash of the files as their
+`build`) and answers homeCore's requests for the files; homeCore passes them to
+the web app and keeps none. A plugin with screens and no actions still
+publishes its manifest. A folder that isn't there, or declares nowhere the app
+can put it, is said in the log and skipped — the app shows its generic screens.
+Each element is handed the app's `host` — the plugin's devices, commands,
+actions, settings and the app's look; its types are `core/sdk/ui`
+(`@homecore/plugin-ui`). `plugins/hc-ecowitt/ui` in core is a complete one.
+
+The `build` is the same in every homeCore SDK for the same folder: the first 8
+bytes of SHA-256 over every file, sorted by path, each fed as its path, a 0
+byte and its contents.
+
 ## API reference
 
 ### Devices
@@ -372,6 +404,7 @@ the change, so the UI and the audit log can say so.
 | Member | Purpose |
 |---|---|
 | `EnableManagementAsync(ManagementOptions)` | Heartbeat, remote management, action manifest |
+| `WithUiDir(dir, version)` | Carry and serve the plugin's own screens |
 | `EnableLogForwarding(minLevel)` | Send your logs to homeCore's live log stream |
 | `ForwardLogAsync(level, message, target:, fields:)` | Forward one line directly |
 | `PublishPluginStatusAsync(status)` | active / degraded / offline |
@@ -493,7 +526,7 @@ zombies with `DELETE /api/v1/plugins/{id}/devices`.
 
 Everything the Rust SDK does is here: registration, state, availability, the
 management protocol, notices, alerts, capability actions including streaming,
-cross-device state subscription, and log forwarding.
+cross-device state subscription, log forwarding, and the plugin's own screens.
 
 Everything the Rust SDK does is here. There is no gap left.
 
