@@ -23,7 +23,7 @@ public class LogForwardingTests
     [Theory]
     [InlineData("host")]
     [InlineData("device_id")]
-    [InlineData("brightness")]
+    [InlineData("brightness_pct")]
     [InlineData("serial")]
     public void OrdinaryFieldNamesAreNot(string name) =>
         Assert.False(LogForwarding.IsSecretField(name), name);

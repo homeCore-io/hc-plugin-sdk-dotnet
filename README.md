@@ -50,7 +50,7 @@ client.OnConnected += async () =>
     // Register here, not before connecting — this runs again after a reconnect.
     await client.RegisterDeviceFullAsync("light.01", "Desk Lamp", deviceType: "light");
     await client.PublishAvailabilityAsync("light.01", true);
-    await client.PublishStateAsync("light.01", new { on = false, brightness = 0 });
+    await client.PublishStateAsync("light.01", new { on = false, brightness_pct = 0 });
 };
 
 client.OnCommand += async (deviceId, payload) =>
@@ -78,7 +78,7 @@ your device  ←→  your plugin  ──state──▶  homeCore  ──▶  rul
                               ◀──cmd────
 ```
 
-Three consequences worth internalising:
+Four consequences worth internalising:
 
 1. **Publish what happened, not what was asked.** A command is a request. If the
    bulb refuses, publish the state it is actually in. That is why the UI can
@@ -87,6 +87,16 @@ Three consequences worth internalising:
    re-registers and re-subscribes.
 3. **You only see your own devices.** Registering a device subscribes to that
    device's command topic and nothing else.
+4. **Use homeCore's names and units.** A shared idea has one name, one unit:
+   `on`, `brightness_pct` (0–100), `color_temp` (kelvin), `transition_ms`,
+   `open` (`true` = open), `occupied`, `battery_pct`, `humidity`,
+   `illuminance` (lux), temperatures in **°C**, and the rest of the table in
+   `core/crates/hc-types/src/device_vocabulary.rs`. Convert from the device's
+   own scale inside the plugin, both ways; showing °F is the app's job. A
+   command arrives as one of two shapes — an attribute write, `{"on": true}`,
+   or a declared action, `{"action": "toggle"}` — never `{"command": …}`.
+   `{"on": true}` restores the last level. See "Names and units" in
+   `core/docs/plugin-development.md`.
 
 ## Installing it into homeCore
 
@@ -527,11 +537,16 @@ zombies with `DELETE /api/v1/plugins/{id}/devices`.
 
 ## Parity with the Rust SDK
 
-Everything the Rust SDK does is here: registration, state, availability, the
+Almost everything the Rust SDK does is here: registration, state, availability, the
 management protocol, notices, alerts, capability actions including streaming,
 cross-device state subscription, log forwarding, and the plugin's own screens.
 
-Everything the Rust SDK does is here. There is no gap left.
+One thing is Rust-only so far: **files sent to an action** (`POST
+/plugins/{id}/upload/{action}`, which the Rust SDK receives as `upload_chunk`
+pieces and hands the action as `file_path`).
+
+The whole process of building a plugin — screens and cards included — is in
+the homeCore repository's `docs/plugin-development.md`.
 
 ## Development
 
