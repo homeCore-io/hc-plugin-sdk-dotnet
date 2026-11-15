@@ -218,6 +218,7 @@ public sealed class PluginClient : IAsyncDisposable
     /// <summary>Connect to the HomeCore MQTT broker.</summary>
     public async Task ConnectAsync(CancellationToken ct = default)
     {
+        Supervised.Watch(_options.PluginId, _logger);
         var builder = new MqttClientOptionsBuilder()
             .WithTcpServer(_options.EffectiveBrokerHost, _options.EffectiveBrokerPort)
             .WithClientId(_options.PluginId)
