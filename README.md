@@ -427,6 +427,7 @@ the change, so the UI and the audit log can say so.
 | `SetPluginAlertsAsync(alerts)` | The same, about the plugin itself |
 | `EnableDevicePersistence(path)` | Remember registered devices across restarts |
 | `ReconcileDevicesAsync(live)` | Unregister everything not in the live set |
+| `StopAsync()` | `OnStop`, every device offline, the plugin offline, disconnect |
 
 ### Events and handlers
 
@@ -437,6 +438,13 @@ the change, so the UI and the audit log can say so.
 | `OnAction` | A capability action; `ctx` is non-null only when streaming |
 | `OnState` | A device you subscribed to changed |
 | `OnSetConfig` | A structured config write |
+| `OnStop` | Stopping. Leave what you control safe; 1 second |
+
+**Stopping.** homeCore and a plugin runtime stop a plugin with SIGTERM, and
+kill it 2 seconds later. After `ConnectAsync`, SIGTERM and Ctrl-C run
+`StopAsync()`: your `OnStop`, then every registered device offline, the plugin
+offline, and a disconnect. Then the process exits. Called directly,
+`StopAsync()` ends `RunAsync()` and leaves the process running.
 | `OnManagementCommand` | Legacy escape hatch, tried before `OnAction` |
 
 ## Log forwarding

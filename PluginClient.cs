@@ -9,8 +9,12 @@
 //   await client.ConnectAsync();
 //   await client.RegisterDeviceTypedAsync("my_device_1", "My Device", "switch");
 //   await client.PublishStateAsync("my_device_1", new { on = true });
-//   await client.RunAsync(); // blocks until cancellation
+//   await client.RunAsync(); // blocks until cancellation or StopAsync
+//
+// SIGTERM (how homeCore and a plugin runtime stop a plugin) and Ctrl-C run
+// StopAsync, which marks every device offline, and then exit the process.
 
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -187,6 +191,25 @@ public sealed class PluginClient : IAsyncDisposable
     public SetConfigHandler? OnSetConfig { get; set; }
 
     /// <summary>
+    /// Called once when the plugin is stopping, before it says goodbye. Leave
+    /// what you control safe here (turn off a heater you were running, close a
+    /// session). It gets 1 second, since homeCore kills a plugin 2 seconds
+    /// after asking it to stop. Your devices are marked offline after it ends.
+    /// </summary>
+    public Func<Task>? OnStop { get; set; }
+
+    /// <summary>How long <see cref="OnStop"/> may take.</summary>
+    internal static readonly TimeSpan StopHookLimit = TimeSpan.FromSeconds(1);
+
+    /// <summary>From the signal to exiting, whatever happens: inside homeCore's 2 seconds.</summary>
+    internal static readonly TimeSpan StopDeadline = TimeSpan.FromMilliseconds(1800);
+
+    private Task? _stopping;
+    private readonly object _stopLock = new();
+    private readonly TaskCompletionSource _stopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly List<PosixSignalRegistration> _signals = new();
+
+    /// <summary>
     /// Conditions this plugin is currently reporting about itself. Raised and
     /// cleared by your code, republished in full on every heartbeat.
     /// </summary>
@@ -219,6 +242,7 @@ public sealed class PluginClient : IAsyncDisposable
     public async Task ConnectAsync(CancellationToken ct = default)
     {
         Supervised.Watch(_options.PluginId, _logger);
+        WatchStopSignals();
         var builder = new MqttClientOptionsBuilder()
             .WithTcpServer(_options.EffectiveBrokerHost, _options.EffectiveBrokerPort)
             .WithClientId(_options.PluginId)
@@ -648,7 +672,7 @@ public sealed class PluginClient : IAsyncDisposable
         _logger.LogInformation("Plugin {PluginId} event loop running", PluginId);
         try
         {
-            await Task.Delay(Timeout.Infinite, ct);
+            await _stopped.Task.WaitAsync(ct);
         }
         catch (OperationCanceledException)
         {
@@ -656,8 +680,93 @@ public sealed class PluginClient : IAsyncDisposable
         }
     }
 
+    // ── Stopping ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Stop: run <see cref="OnStop"/>, mark every registered device offline,
+    /// report the plugin offline, disconnect, and let <see cref="RunAsync"/>
+    /// return.
+    /// </summary>
+    /// <remarks>
+    /// Run on SIGTERM (how homeCore and a plugin runtime stop a plugin) and on
+    /// Ctrl-C, which then exit the process, so a stopped plugin's devices read
+    /// offline at once rather than showing their last state as if nothing had
+    /// happened. Called directly, it leaves the process running. Safe to call
+    /// more than once: every call returns the same task.
+    /// </remarks>
+    public Task StopAsync()
+    {
+        lock (_stopLock)
+            return _stopping ??= StopOnceAsync();
+    }
+
+    private async Task StopOnceAsync()
+    {
+        if (OnStop is { } hook)
+        {
+            try
+            {
+                var run = Task.Run(hook);
+                if (await Task.WhenAny(run, Task.Delay(StopHookLimit)) != run)
+                    _logger.LogWarning("OnStop took over a second; stopping anyway");
+                else
+                    await run;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "OnStop failed; stopping anyway");
+            }
+        }
+        _heartbeatCts?.Cancel();
+        var ids = _devices.Snapshot().OrderBy(x => x, StringComparer.Ordinal).ToList();
+        foreach (var deviceId in ids)
+            await Quietly(PublishAvailabilityAsync(deviceId, false));
+        await Quietly(PublishPluginStatusAsync("offline"));
+        _logger.LogInformation("Plugin {PluginId} stopping; {Count} device(s) offline", PluginId, ids.Count);
+        if (_mqtt.IsConnected)
+            await Quietly(_mqtt.DisconnectAsync());
+        _stopped.TrySetResult();
+    }
+
+    private async Task Quietly(Task task)
+    {
+        try { await task; }
+        catch (Exception ex) { _logger.LogWarning("While stopping: {Error}", ex.Message); }
+    }
+
+    /// <summary>SIGTERM and Ctrl-C stop the plugin and then exit. Watched once.</summary>
+    private void WatchStopSignals()
+    {
+        lock (_stopLock)
+        {
+            if (_signals.Count > 0) return;
+            foreach (var signal in new[] { PosixSignal.SIGTERM, PosixSignal.SIGINT })
+            {
+                try
+                {
+                    _signals.Add(PosixSignalRegistration.Create(signal, ctx =>
+                    {
+                        // Ours to end, once the goodbye is out.
+                        ctx.Cancel = true;
+                        _ = Task.Run(async () =>
+                        {
+                            await Task.WhenAny(StopAsync(), Task.Delay(StopDeadline));
+                            Environment.Exit(0);
+                        });
+                    }));
+                }
+                catch (PlatformNotSupportedException)
+                {
+                    // Not on this platform: the runtime's default stands.
+                }
+            }
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
+        foreach (var registration in _signals)
+            registration.Dispose();
         _heartbeatCts?.Cancel();
         if (_mqtt.IsConnected)
             await _mqtt.DisconnectAsync();
