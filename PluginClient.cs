@@ -1,6 +1,6 @@
-// HomeCore Plugin SDK for .NET
+// homeCore Plugin SDK for .NET
 //
-// Provides PluginClient for connecting to the HomeCore MQTT broker,
+// Provides PluginClient for connecting to the homeCore MQTT broker,
 // publishing device state, registering devices, and handling commands.
 //
 // Usage:
@@ -139,7 +139,7 @@ public delegate Task StateHandler(string deviceId, JsonElement state);
 public delegate Task<bool> SetConfigHandler(JsonElement config);
 
 /// <summary>
-/// Connected HomeCore plugin client.
+/// Connected homeCore plugin client.
 /// Publishes device state, registers devices, subscribes to commands,
 /// and optionally runs the management protocol (heartbeat + remote config).
 /// </summary>
@@ -348,7 +348,7 @@ public sealed class PluginClient : IAsyncDisposable
 
     // ── Connection ────────────────────────────────────────────────────────
 
-    /// <summary>Connect to the HomeCore MQTT broker.</summary>
+    /// <summary>Connect to the homeCore MQTT broker.</summary>
     /// <remarks>
     /// Throws when the broker can't be reached. Once connected, a lost
     /// connection is reconnected on its own: <see cref="OnDisconnected"/>
@@ -371,7 +371,7 @@ public sealed class PluginClient : IAsyncDisposable
         var mqttOptions = builder.Build();
         await _mqtt.ConnectAsync(mqttOptions, ct);
         _mqttOptions = mqttOptions;
-        _logger.LogInformation("Connected to HomeCore broker at {Host}:{Port}",
+        _logger.LogInformation("Connected to homeCore broker at {Host}:{Port}",
             _options.EffectiveBrokerHost, _options.EffectiveBrokerPort);
         await AfterConnectAsync(ct);
     }
@@ -528,7 +528,7 @@ public sealed class PluginClient : IAsyncDisposable
         await TrackDeviceAsync(deviceId);
     }
 
-    /// <summary>Register a device by type name (HomeCore resolves capabilities from catalog).</summary>
+    /// <summary>Register a device by type name (homeCore resolves capabilities from catalog).</summary>
     public async Task RegisterDeviceTypedAsync(
         string deviceId, string name, string deviceType, string? area = null)
     {
@@ -911,7 +911,7 @@ public sealed class PluginClient : IAsyncDisposable
         // ClientWasConnected false: the loop is already handling it.
         if (!e.ClientWasConnected || _closing || _mqttOptions is null)
             return Task.CompletedTask;
-        _logger.LogWarning("Lost the connection to the HomeCore broker ({Reason}); reconnecting",
+        _logger.LogWarning("Lost the connection to the homeCore broker ({Reason}); reconnecting",
             e.Reason);
         StartReconnecting();
         return Task.CompletedTask;
@@ -957,7 +957,7 @@ public sealed class PluginClient : IAsyncDisposable
         Interlocked.Exchange(ref _reconnecting, 0);
         if (!connected) return;
 
-        _logger.LogInformation("Reconnected to HomeCore broker at {Host}:{Port}",
+        _logger.LogInformation("Reconnected to homeCore broker at {Host}:{Port}",
             _options.EffectiveBrokerHost, _options.EffectiveBrokerPort);
         try
         {
