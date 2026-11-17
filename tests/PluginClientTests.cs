@@ -221,6 +221,213 @@ public class PluginClientTests
         Assert.Equal("error", resp["status"]!.GetValue<string>());
     }
 
+    // ── who called ───────────────────────────────────────────────────────
+
+    private const string WithCaller =
+        """{"action":"whoami","request_id":"r1","value":7,"caller":{"uid":"u1","username":"ann","role":"user","scopes":["devices:read"],"kind":"api_key"}}""";
+
+    private static Capabilities WhoAmI(bool stream = false) => new()
+    {
+        Actions = new[]
+        {
+            new PluginAction { Id = "whoami", Label = "Who am I", Stream = stream },
+        },
+    };
+
+    [Fact]
+    public async Task OnActionWithCallerHearsWhoCalledAndParamsStayClean()
+    {
+        var c = NewClient();
+        SetMgmt(c, new ManagementOptions { Capabilities = WhoAmI() });
+        Caller? seen = null;
+        string? paramsSeen = null;
+        c.OnActionWithCaller = (_, @params, ctx, caller) =>
+        {
+            seen = caller;
+            paramsSeen = @params.GetRawText();
+            return Task.FromResult<JsonObject?>(new JsonObject { ["name"] = caller?.Username });
+        };
+
+        var resp = await Manage(c, WithCaller);
+        Assert.Equal("ann", resp["name"]!.GetValue<string>());
+        Assert.Equal(
+            ("u1", "ann", "user", "api_key"),
+            (seen!.Uid, seen.Username, seen.Role, seen.Kind));
+        Assert.Equal(new[] { "devices:read" }, seen.Scopes);
+        Assert.DoesNotContain("caller", paramsSeen);
+        Assert.Contains("value", paramsSeen);
+    }
+
+    [Fact]
+    public async Task OnActionAloneStillWorksAndNeverSeesTheCaller()
+    {
+        var c = NewClient();
+        SetMgmt(c, new ManagementOptions { Capabilities = WhoAmI() });
+        string? paramsSeen = null;
+        c.OnAction = (_, @params, _) =>
+        {
+            paramsSeen = @params.GetRawText();
+            return Task.FromResult<JsonObject?>(new JsonObject());
+        };
+
+        var resp = await Manage(c, WithCaller);
+        Assert.Equal("ok", resp["status"]!.GetValue<string>());
+        Assert.DoesNotContain("caller", paramsSeen);
+    }
+
+    [Fact]
+    public async Task OnActionWithCallerWinsWhenBothAreSet()
+    {
+        var c = NewClient();
+        SetMgmt(c, new ManagementOptions { Capabilities = WhoAmI() });
+        c.OnAction = (_, _, _) => Task.FromResult<JsonObject?>(new JsonObject { ["by"] = "plain" });
+        c.OnActionWithCaller = (_, _, _, _) =>
+            Task.FromResult<JsonObject?>(new JsonObject { ["by"] = "caller" });
+
+        var resp = await Manage(c, WithCaller);
+        Assert.Equal("caller", resp["by"]!.GetValue<string>());
+    }
+
+    [Theory]
+    [InlineData("""{"action":"whoami","request_id":"r1"}""")]
+    [InlineData("""{"action":"whoami","request_id":"r1","caller":"ann"}""")]
+    [InlineData("""{"action":"whoami","request_id":"r1","caller":null}""")]
+    public async Task CallerIsNullWhenAbsentOrNotAnObject(string cmd)
+    {
+        var c = NewClient();
+        SetMgmt(c, new ManagementOptions { Capabilities = WhoAmI() });
+        var called = false;
+        Caller? seen = null;
+        c.OnActionWithCaller = (_, _, _, caller) =>
+        {
+            called = true;
+            seen = caller;
+            return Task.FromResult<JsonObject?>(new JsonObject());
+        };
+
+        await Manage(c, cmd);
+        Assert.True(called);
+        Assert.Null(seen);
+    }
+
+    [Fact]
+    public async Task AStreamingActionReadsTheCallerFromItsContext()
+    {
+        var c = NewClient();
+        c.PublishSink = (_, _, _) => Task.CompletedTask;
+        SetMgmt(c, new ManagementOptions { Capabilities = WhoAmI(stream: true) });
+        var got = new TaskCompletionSource<Caller?>();
+        c.OnAction = async (_, _, ctx) =>
+        {
+            got.TrySetResult(ctx!.Caller);
+            await ctx.CompleteAsync();
+            return null;
+        };
+
+        var resp = await Manage(c, WithCaller);
+        Assert.Equal("accepted", resp["status"]!.GetValue<string>());
+        var caller = await got.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("ann", caller!.Username);
+        Assert.Equal("api_key", caller.Kind);
+    }
+
+    // ── REST access from homeCore ────────────────────────────────────────
+
+    [Fact]
+    public async Task ApiAccessIsKeptAndTheHookHearsIt()
+    {
+        var c = NewClient();
+        SetMgmt(c, new ManagementOptions());
+        (string Url, string Key, IReadOnlyList<string> Scopes)? heard = null;
+        c.OnApiAccess = (url, key, scopes) => { heard = (url, key, scopes); return Task.CompletedTask; };
+        Assert.Null(c.ApiAccess);
+
+        var resp = await Manage(
+            c,
+            """{"action":"api_access","request_id":"r1","url":"http://127.0.0.1:8080/api/v1/","key":"hc_sk_secret","scopes":["devices:read","devices:command"]}""");
+
+        Assert.Equal("ok", resp["status"]!.GetValue<string>());
+        var access = c.ApiAccess!;
+        Assert.Equal("http://127.0.0.1:8080/api/v1", access.Url);
+        Assert.Equal("hc_sk_secret", access.Key);
+        Assert.Equal(new[] { "devices:read", "devices:command" }, access.Scopes);
+        Assert.Equal(("http://127.0.0.1:8080/api/v1", "hc_sk_secret"), (heard!.Value.Url, heard.Value.Key));
+        Assert.Same(access, await c.WaitForApiAccessAsync(TimeSpan.FromSeconds(1)));
+    }
+
+    [Fact]
+    public async Task ApiAccessAcceptsANestedParamsObject()
+    {
+        var c = NewClient();
+        SetMgmt(c, new ManagementOptions());
+        var resp = await Manage(
+            c,
+            """{"action":"api_access","request_id":"r1","params":{"url":"http://h/api/v1","key":"k"}}""");
+        Assert.Equal("ok", resp["status"]!.GetValue<string>());
+        Assert.Equal("http://h/api/v1", c.ApiAccess!.Url);
+        Assert.Empty(c.ApiAccess.Scopes);
+    }
+
+    [Theory]
+    [InlineData("""{"action":"api_access","request_id":"r1","key":"k"}""")]
+    [InlineData("""{"action":"api_access","request_id":"r1","url":"http://h/api/v1"}""")]
+    [InlineData("""{"action":"api_access","request_id":"r1","url":"","key":"k"}""")]
+    public async Task ApiAccessWithoutAUrlAndAKeyIsAnError(string cmd)
+    {
+        var c = NewClient();
+        SetMgmt(c, new ManagementOptions());
+        var resp = await Manage(c, cmd);
+        Assert.Equal("error", resp["status"]!.GetValue<string>());
+        Assert.Equal("api_access needs a url and a key", resp["error"]!.GetValue<string>());
+        Assert.Null(c.ApiAccess);
+    }
+
+    [Fact]
+    public async Task AThrowingApiAccessHookStillAnswersOk()
+    {
+        var c = NewClient();
+        SetMgmt(c, new ManagementOptions());
+        c.OnApiAccess = (_, _, _) => throw new InvalidOperationException("hook exploded");
+        var resp = await Manage(
+            c, """{"action":"api_access","request_id":"r1","url":"http://h/api/v1","key":"k"}""");
+        Assert.Equal("ok", resp["status"]!.GetValue<string>());
+        Assert.NotNull(c.ApiAccess);
+    }
+
+    [Fact]
+    public async Task WaitForApiAccessReturnsNullOnTimeoutAndTheAccessOnceItArrives()
+    {
+        var c = NewClient();
+        SetMgmt(c, new ManagementOptions());
+        Assert.Null(await c.WaitForApiAccessAsync(TimeSpan.FromMilliseconds(20)));
+
+        var waiting = c.WaitForApiAccessAsync(TimeSpan.FromSeconds(5));
+        Assert.False(waiting.IsCompleted);
+        await Manage(
+            c, """{"action":"api_access","request_id":"r1","url":"http://h/api/v1","key":"k"}""");
+        Assert.Equal("http://h/api/v1", (await waiting)!.Url);
+    }
+
+    [Fact]
+    public async Task WaitForApiAccessHonoursCancellation()
+    {
+        var c = NewClient();
+        using var cts = new CancellationTokenSource();
+        var waiting = c.WaitForApiAccessAsync(TimeSpan.FromSeconds(5), cts.Token);
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waiting);
+    }
+
+    [Fact]
+    public void TheKeyNeverShowsInToString()
+    {
+        var access = new ApiAccess("http://h/api/v1", "hc_sk_secret", new[] { "devices:read" });
+        var text = access.ToString();
+        Assert.DoesNotContain("hc_sk_secret", text);
+        Assert.Contains("http://h/api/v1", text);
+        Assert.Contains("devices:read", text);
+    }
+
     // ── device ownership ─────────────────────────────────────────────────
 
     [Fact]

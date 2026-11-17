@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Globalization;
 using System.Text.Json.Nodes;
 using System.Threading.Channels;
 
@@ -41,12 +43,16 @@ public sealed class StreamContext
         Channel.CreateUnbounded<JsonObject>();
     private int _terminal;
     private volatile bool _canceled;
+    private DateTime? _lastTs;
+    private readonly object _tsLock = new();
 
-    internal StreamContext(PluginClient plugin, string requestId, string actionId)
+    internal StreamContext(
+        PluginClient plugin, string requestId, string actionId, Caller? caller = null)
     {
         _plugin = plugin;
         RequestId = requestId;
         ActionId = actionId;
+        Caller = caller;
         Topic = $"homecore/plugins/{plugin.PluginId}/commands/{requestId}/events";
     }
 
@@ -54,15 +60,39 @@ public sealed class StreamContext
     public string ActionId { get; }
     public string Topic { get; }
 
+    /// <summary>
+    /// Who started this action, as homeCore verified them. Null when the
+    /// homeCore that sent it is too old to say.
+    /// </summary>
+    public Caller? Caller { get; }
+
     // ── non-terminal stages ──────────────────────────────────────────────
 
-    /// <summary>Report progress. Every field is optional — send whichever you have.</summary>
-    public Task ProgressAsync(int? percent = null, string? label = null, string? message = null)
+    /// <summary>Report progress. Every field is optional; send whichever you have.</summary>
+    /// <param name="percent">How far along, 0 to 100.</param>
+    /// <param name="label">A short phase name.</param>
+    /// <param name="message">A line for the operator.</param>
+    /// <param name="data">
+    /// Anything a plugin's own screen reads from the stream (a chat's text as
+    /// it is written, say). Sent as <c>data</c>; the generic UI ignores it.
+    /// </param>
+    public Task ProgressAsync(
+        int? percent = null, string? label = null, string? message = null, JsonObject? data = null) =>
+        Progress(percent, label, message, data);
+
+    // 0.4.4's signature, kept so a plugin built against 0.4.4 still runs with
+    // this DLL. A call that passes every argument but data compiles to it.
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task ProgressAsync(int? percent, string? label, string? message) =>
+        Progress(percent, label, message, null);
+
+    private Task Progress(int? percent, string? label, string? message, JsonObject? data)
     {
         var ev = new JsonObject { ["stage"] = "progress" };
         if (percent is not null) ev["percent"] = percent;
         if (label is not null) ev["label"] = label;
         if (message is not null) ev["message"] = message;
+        if (data is not null) ev["data"] = data.DeepClone();
         return EmitAsync(ev, terminal: false);
     }
 
@@ -101,10 +131,26 @@ public sealed class StreamContext
     /// Ask the operator for something and keep the stream open. Emit this, then
     /// await <see cref="AwaitRespondAsync"/>.
     /// </summary>
-    public Task AwaitingUserAsync(string prompt, JsonNode? responseSchema = null)
+    /// <param name="prompt">What to ask.</param>
+    /// <param name="responseSchema">JSON Schema of the answer, for a form.</param>
+    /// <param name="data">
+    /// For a plugin's own screen: what to show with the question (a preview of
+    /// a change, say). Sent as <c>data</c>; the generic UI ignores it.
+    /// </param>
+    public Task AwaitingUserAsync(
+        string prompt, JsonNode? responseSchema = null, JsonObject? data = null) =>
+        AwaitingUser(prompt, responseSchema, data);
+
+    // 0.4.4's signature, kept for plugins built against it (see ProgressAsync).
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task AwaitingUserAsync(string prompt, JsonNode? responseSchema) =>
+        AwaitingUser(prompt, responseSchema, null);
+
+    private Task AwaitingUser(string prompt, JsonNode? responseSchema, JsonObject? data)
     {
         var ev = new JsonObject { ["stage"] = "awaiting_user", ["prompt"] = prompt };
         if (responseSchema is not null) ev["response_schema"] = responseSchema.DeepClone();
+        if (data is not null) ev["data"] = data.DeepClone();
         return EmitAsync(ev, terminal: false);
     }
 
@@ -155,10 +201,34 @@ public sealed class StreamContext
         if (terminal) Volatile.Write(ref _terminal, 1);
 
         ev["request_id"] = RequestId;
-        ev["ts"] = DateTime.UtcNow.ToString("o");
+        ev["ts"] = NextTs();
         // Retained, so a UI that subscribes mid-action sees the latest frame
         // rather than an empty screen until the next one.
         await _plugin.PublishRawInternalAsync(Topic, ev.ToJsonString(), retain: true);
+    }
+
+    /// <summary>
+    /// Now, but always later than this stream's previous event.
+    /// </summary>
+    /// <remarks>
+    /// Events emitted back to back (a chat's text as it is written) can fall in
+    /// the same microsecond, and a reader that drops an event whose <c>ts</c>
+    /// it has already seen would lose one. So each is at least a microsecond
+    /// after the last. ISO 8601 UTC with microseconds, as the Python SDK
+    /// writes it.
+    /// </remarks>
+    internal string NextTs()
+    {
+        const long TicksPerMicrosecond = TimeSpan.TicksPerMillisecond / 1000;
+        lock (_tsLock)
+        {
+            var ticks = DateTime.UtcNow.Ticks;
+            var now = new DateTime(ticks - ticks % TicksPerMicrosecond, DateTimeKind.Utc);
+            if (_lastTs is { } last && now <= last)
+                now = last.AddTicks(TicksPerMicrosecond);
+            _lastTs = now;
+            return now.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'", CultureInfo.InvariantCulture);
+        }
     }
 
     /// <summary>
@@ -176,7 +246,7 @@ public sealed class StreamContext
             {
                 ["stage"] = "error",
                 ["request_id"] = RequestId,
-                ["ts"] = DateTime.UtcNow.ToString("o"),
+                ["ts"] = NextTs(),
                 ["message"] = error is null
                     ? "plugin dropped stream without emitting a terminal stage"
                     : $"plugin action failed: {error.Message}",

@@ -103,6 +103,26 @@ public delegate Task<JsonObject?> ManagementCommandHandler(string action, JsonEl
 /// </returns>
 public delegate Task<JsonObject?> ActionHandler(string action, JsonElement @params, StreamContext? ctx);
 
+/// <summary>
+/// An <see cref="ActionHandler"/> that also hears who called.
+/// </summary>
+/// <param name="action">The action id.</param>
+/// <param name="params">Everything the command carried but the envelope and the caller.</param>
+/// <param name="ctx">Present only for streaming actions.</param>
+/// <param name="caller">
+/// Who homeCore verified made the request, or null when the homeCore that
+/// sent it is too old to say. The same value as <see cref="StreamContext.Caller"/>.
+/// </param>
+public delegate Task<JsonObject?> CallerActionHandler(
+    string action, JsonElement @params, StreamContext? ctx, Caller? caller);
+
+/// <summary>
+/// homeCore has sent this plugin REST access: its API base
+/// <paramref name="url"/>, a bearer <paramref name="key"/>, and the
+/// <paramref name="scopes"/> the key carries.
+/// </summary>
+public delegate Task ApiAccessHandler(string url, string key, IReadOnlyList<string> scopes);
+
 /// <summary>Handles a state update for a device this plugin does not own.</summary>
 public delegate Task StateHandler(string deviceId, JsonElement state);
 
@@ -156,7 +176,7 @@ public sealed class PluginClient : IAsyncDisposable
     private LogLevel _logForwardMinLevel = LogLevel.Information;
 
     /// <summary>This SDK's version, reported in every heartbeat.</summary>
-    public const string SdkVersion = "0.4.4";
+    public const string SdkVersion = "0.4.5";
 
     /// <summary>
     /// The wire protocol this SDK speaks, which is core's hc-types version.
@@ -180,6 +200,67 @@ public sealed class PluginClient : IAsyncDisposable
 
     /// <summary>Handles capability actions. See <see cref="ActionHandler"/>.</summary>
     public ActionHandler? OnAction { get; set; }
+
+    /// <summary>
+    /// Handles capability actions and hears who called. When set, it is used
+    /// in place of <see cref="OnAction"/>; plugins that set only
+    /// <see cref="OnAction"/> keep working as before.
+    /// </summary>
+    /// <remarks>
+    /// homeCore says who made each request: <see cref="Caller.Uid"/>,
+    /// <see cref="Caller.Username"/>, <see cref="Caller.Role"/>,
+    /// <see cref="Caller.Scopes"/> and <see cref="Caller.Kind"/>. It is never
+    /// mixed into the params. A streaming handler can also read it as
+    /// <see cref="StreamContext.Caller"/>.
+    /// </remarks>
+    public CallerActionHandler? OnActionWithCaller { get; set; }
+
+    /// <summary>
+    /// homeCore has sent REST access (see <see cref="ApiAccessHandler"/>).
+    /// </summary>
+    /// <remarks>
+    /// Arrives after every start (the key is reminted each time, and the old
+    /// one revoked), so replace whatever client you built from the last one.
+    /// Runs on the MQTT message loop: keep it quick. <see cref="ApiAccess"/>
+    /// holds the same values whether or not this is set.
+    /// </remarks>
+    public ApiAccessHandler? OnApiAccess { get; set; }
+
+    // REST access from core, once it has sent it (see OnApiAccess).
+    private ApiAccess? _apiAccess;
+    private readonly TaskCompletionSource<ApiAccess> _apiAccessReady =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    /// The REST access homeCore granted, or null until it arrives. Only a
+    /// plugin whose manifest declares <see cref="Capabilities.ApiScopes"/> is
+    /// sent one.
+    /// </summary>
+    public ApiAccess? ApiAccess => Volatile.Read(ref _apiAccess);
+
+    /// <summary>
+    /// Wait until homeCore has sent REST access, or <paramref name="timeout"/>
+    /// passes.
+    /// </summary>
+    /// <remarks>
+    /// The access arrives on the management topic, so await this after
+    /// <see cref="EnableManagementAsync"/>.
+    /// </remarks>
+    /// <returns>The access, or null on timeout.</returns>
+    /// <exception cref="OperationCanceledException"><paramref name="ct"/> was canceled.</exception>
+    public async Task<ApiAccess?> WaitForApiAccessAsync(
+        TimeSpan timeout, CancellationToken ct = default)
+    {
+        try
+        {
+            await _apiAccessReady.Task.WaitAsync(timeout, ct);
+        }
+        catch (TimeoutException)
+        {
+            // Not yet; the caller decides what that means.
+        }
+        return ApiAccess;
+    }
 
     /// <summary>
     /// A device subscribed to with <see cref="SubscribeStateAsync"/> changed.
@@ -902,6 +983,9 @@ public sealed class PluginClient : IAsyncDisposable
             case "set_config":
                 return await HandleSetConfigAsync(cmd, requestId);
 
+            case "api_access":
+                return await HandleApiAccessAsync(cmd, requestId);
+
             case "set_log_level":
             {
                 var level = cmd.TryGetProperty("level", out var lv) ? lv.GetString() ?? "info" : "info";
@@ -1007,30 +1091,77 @@ public sealed class PluginClient : IAsyncDisposable
         }
     }
 
-    /// <summary>Route a management command that is not a built-in to <see cref="OnAction"/>.</summary>
+    /// <summary>
+    /// Keep the REST access core sent and tell the plugin.
+    /// </summary>
+    /// <remarks>
+    /// Core sends the fields at the top level of the management payload; a
+    /// nested <c>params</c> object is accepted too. The key is never logged.
+    /// </remarks>
+    private async Task<JsonObject> HandleApiAccessAsync(JsonElement cmd, string requestId)
+    {
+        var body = cmd.TryGetProperty("params", out var p) && p.ValueKind == JsonValueKind.Object
+            ? p : cmd;
+        static string? Text(JsonElement o, string key) =>
+            o.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String
+                ? v.GetString() : null;
+        var url = Text(body, "url");
+        var key = Text(body, "key");
+        if (string.IsNullOrEmpty(url) || string.IsNullOrEmpty(key))
+            return ErrorResponse(requestId, "api_access needs a url and a key");
+        var scopes = body.TryGetProperty("scopes", out var s)
+            ? Caller.Strings(s) : Array.Empty<string>();
+
+        var access = new ApiAccess(url.TrimEnd('/'), key, scopes);
+        Volatile.Write(ref _apiAccess, access);
+        _logger.LogInformation(
+            "homeCore granted REST access at {Url} ({Count} scopes)", access.Url, scopes.Count);
+
+        if (OnApiAccess is { } hook)
+        {
+            try
+            {
+                await hook(access.Url, key, scopes);
+            }
+            catch (Exception ex)
+            {
+                // A plugin bug must not take down the message loop.
+                _logger.LogError(ex, "OnApiAccess failed");
+            }
+        }
+        _apiAccessReady.TrySetResult(access);
+        return Ok(requestId);
+    }
+
+    /// <summary>
+    /// Route a management command that is not a built-in to
+    /// <see cref="OnActionWithCaller"/> or <see cref="OnAction"/>.
+    /// </summary>
     private async Task<JsonObject> DispatchActionAsync(
         string action, string requestId, JsonElement cmd)
     {
         var declared = _mgmt?.Capabilities?.Actions.FirstOrDefault(a => a.Id == action);
 
-        // Params are everything that is not protocol envelope.
+        // Params are everything that is not protocol envelope. `caller` is who
+        // core verified made the request; it is never a param.
         var paramsObj = new JsonObject();
         foreach (var prop in cmd.EnumerateObject())
         {
-            if (prop.Name is "action" or "request_id" or "target_request_id") continue;
+            if (prop.Name is "action" or "request_id" or "target_request_id" or "caller") continue;
             paramsObj[prop.Name] = JsonNode.Parse(prop.Value.GetRawText());
         }
         var paramsElement = JsonDocument.Parse(paramsObj.ToJsonString()).RootElement;
+        var caller = Caller.FromCommand(cmd);
 
         if (declared is { Stream: true })
-            return StartStream(declared, requestId, paramsElement);
+            return StartStream(declared, requestId, paramsElement, caller);
 
-        if (OnAction is null)
+        if (OnActionWithCaller is null && OnAction is null)
             return ErrorResponse(requestId, $"unknown action: {action}");
 
         try
         {
-            var result = await OnAction.Invoke(action, paramsElement, null);
+            var result = await InvokeActionAsync(action, paramsElement, null, caller);
             if (result is null)
                 return ErrorResponse(requestId, $"unknown action: {action}");
             result["request_id"] = requestId;
@@ -1045,8 +1176,23 @@ public sealed class PluginClient : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Call whichever action handler the plugin set, preferring the one that
+    /// hears the caller.
+    /// </summary>
+    private Task<JsonObject?> InvokeActionAsync(
+        string action, JsonElement @params, StreamContext? ctx, Caller? caller)
+    {
+        if (OnActionWithCaller is { } withCaller)
+            return withCaller(action, @params, ctx, caller);
+        if (OnAction is { } plain)
+            return plain(action, @params, ctx);
+        return Task.FromResult<JsonObject?>(null);
+    }
+
     /// <summary>Run a streaming action and answer <c>accepted</c> straight away.</summary>
-    private JsonObject StartStream(PluginAction declared, string requestId, JsonElement @params)
+    private JsonObject StartStream(
+        PluginAction declared, string requestId, JsonElement @params, Caller? caller = null)
     {
         if (string.IsNullOrEmpty(requestId))
             return ErrorResponse("", "streaming action requires request_id");
@@ -1065,7 +1211,7 @@ public sealed class PluginClient : IAsyncDisposable
                 };
         }
 
-        var ctx = new StreamContext(this, requestId, declared.Id);
+        var ctx = new StreamContext(this, requestId, declared.Id, caller);
         lock (_streamsLock) _activeStreams[requestId] = ctx;
 
         // Runs on its own task, so a slow action never stalls the message loop.
@@ -1076,8 +1222,7 @@ public sealed class PluginClient : IAsyncDisposable
             Exception? failure = null;
             try
             {
-                if (OnAction is not null)
-                    await OnAction.Invoke(declared.Id, @params, ctx);
+                await InvokeActionAsync(declared.Id, @params, ctx, caller);
             }
             catch (Exception ex)
             {
