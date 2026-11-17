@@ -25,6 +25,18 @@ public enum RequiresRole
     Admin,
     User,
     ReadOnly,
+
+    /// <summary>
+    /// Anyone signed in to homeCore, household members and read-only accounts
+    /// included. Serialized as <c>signed_in</c>.
+    /// </summary>
+    /// <remarks>
+    /// The only level that opens an action to people without
+    /// <c>plugins:write</c>. The handler gets the verified
+    /// <see cref="Caller"/> and must limit what it does to the caller's own
+    /// <see cref="Caller.Scopes"/>.
+    /// </remarks>
+    SignedIn,
 }
 
 /// <summary>Item operations a streaming action may emit, if it emits items at all.</summary>
@@ -121,6 +133,7 @@ public sealed record PluginAction
             {
                 RequiresRole.Admin => "admin",
                 RequiresRole.ReadOnly => "read_only",
+                RequiresRole.SignedIn => "signed_in",
                 _ => "user",
             },
         };
@@ -181,6 +194,17 @@ public sealed class Capabilities
     /// </summary>
     public IReadOnlyList<PluginAlertKind> AlertKinds { get; init; } = Array.Empty<PluginAlertKind>();
 
+    /// <summary>
+    /// REST scopes the plugin needs from homeCore's API (<c>devices:read</c>,
+    /// <c>devices:command</c>, ...). When this is not empty, homeCore mints the
+    /// plugin its own API key on every start and hands it over with the
+    /// <c>api_access</c> management action; see
+    /// <see cref="PluginClient.OnApiAccess"/> and
+    /// <see cref="PluginClient.ApiAccess"/>. Nothing to paste and nothing
+    /// stored in the plugin's config.
+    /// </summary>
+    public IReadOnlyList<string> ApiScopes { get; init; } = Array.Empty<string>();
+
     internal string PluginId { get; set; } = "";
 
     public JsonObject ToJson()
@@ -201,6 +225,12 @@ public sealed class Capabilities
             var kinds = new JsonArray();
             foreach (var k in AlertKinds) kinds.Add(k.ToJson());
             o["alert_kinds"] = kinds;
+        }
+        if (ApiScopes.Count > 0)
+        {
+            var scopes = new JsonArray();
+            foreach (var scope in ApiScopes) scopes.Add(scope);
+            o["api_scopes"] = scopes;
         }
         if (ConfigSchema is not null) o["config_schema"] = ConfigSchema.DeepClone();
         if (ConfigDescriptor is not null) o["config_descriptor"] = ConfigDescriptor.DeepClone();

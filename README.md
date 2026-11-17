@@ -299,7 +299,7 @@ Streaming handlers run on their own task, so blocking work is fine.
 
 | Stage | Meaning |
 |---|---|
-| `ProgressAsync(...)` | percent / label / message, as often as useful |
+| `ProgressAsync(...)` | percent / label / message / data, as often as useful |
 | `ItemAddAsync/ItemUpdateAsync/ItemRemoveAsync(data)` | one thing found or changed — include the `ItemKey` field so the UI updates a row rather than appending |
 | `WarningAsync(msg)` | recoverable; **the stream continues** |
 | `AwaitingUserAsync(prompt)` | ask for something, then `await ctx.AwaitRespondAsync()` |
@@ -317,6 +317,64 @@ never left waiting on a stream that quietly stopped.
 await ctx.AwaitingUserAsync("Press the pairing button on the device now.");
 var answer = await ctx.AwaitRespondAsync();
 ```
+
+`ProgressAsync` and `AwaitingUserAsync` also take `data:`, a `JsonObject` a
+plugin's own screen reads from the stream (text as it is written, a preview to
+confirm). The generic UI ignores it.
+
+### Who called
+
+homeCore passes the verified caller with every action as a `Caller`: `Uid`,
+`Username`, `Role`, `Scopes` and `Kind` (`user`, `api_key`, `local_admin` or
+`whitelist`). It is never mixed into `params`. A streaming handler reads
+`ctx.Caller`; for an immediate one, set `OnActionWithCaller` in place of
+`OnAction` and the SDK passes it. Plugins that set only `OnAction` keep working.
+
+```csharp
+client.OnActionWithCaller = async (action, @params, ctx, caller) =>
+{
+    if (action == "whoami")
+        return new JsonObject { ["name"] = caller?.Username };
+    return null;
+};
+```
+
+Most actions still need an admin (`plugins:write`), whatever role they declare.
+An action declared with `RequiresRole = RequiresRole.SignedIn` can be called by
+anyone signed in, household members and read-only accounts included, so use
+`caller.Scopes` to stay within what that person may do.
+
+## REST access from homeCore
+
+A plugin that needs homeCore's REST API asks for scopes in its manifest, and
+homeCore mints it a key on every start. Nothing to paste, nothing stored in the
+config file.
+
+```csharp
+new Capabilities
+{
+    Actions = new[] { /* ... */ },
+    ApiScopes = new[] { "devices:read", "devices:command" },
+}
+```
+
+The key arrives with the `api_access` management action. The SDK keeps it in
+`client.ApiAccess` (`Url`, `Key`, `Scopes`; the key never shows in
+`ToString()`) and calls your handler:
+
+```csharp
+client.OnApiAccess = (url, key, scopes) =>
+{
+    rest = new MyClient(url, key);      // url already ends in /api/v1
+    return Task.CompletedTask;
+};
+
+// or, after EnableManagementAsync:
+var access = await client.WaitForApiAccessAsync(TimeSpan.FromSeconds(30));
+```
+
+homeCore leaves out scopes no plugin may hold (`users:write`,
+`api_keys:admin`), so check `Scopes` rather than assuming you got everything.
 
 ## Cross-device plugins
 
@@ -428,6 +486,7 @@ the change, so the UI and the audit log can say so.
 | `EnableDevicePersistence(path)` | Remember registered devices across restarts |
 | `ReconcileDevicesAsync(live)` | Unregister everything not in the live set |
 | `StopAsync()` | `OnStop`, every device offline, the plugin offline, disconnect |
+| `ApiAccess` / `WaitForApiAccessAsync(timeout)` | REST access homeCore granted, or null |
 
 ### Events and handlers
 
@@ -436,16 +495,18 @@ the change, so the UI and the audit log can say so.
 | `OnConnected` | Connected. Register devices, enable management |
 | `OnCommand` | A command for one of your devices |
 | `OnAction` | A capability action; `ctx` is non-null only when streaming |
+| `OnActionWithCaller` | The same, with the `Caller`; used in place of `OnAction` when set |
 | `OnState` | A device you subscribed to changed |
 | `OnSetConfig` | A structured config write |
+| `OnApiAccess` | homeCore sent REST access (every start) |
 | `OnStop` | Stopping. Leave what you control safe; 1 second |
+| `OnManagementCommand` | Legacy escape hatch, tried before `OnAction` |
 
 **Stopping.** homeCore and a plugin runtime stop a plugin with SIGTERM, and
 kill it 2 seconds later. After `ConnectAsync`, SIGTERM and Ctrl-C run
 `StopAsync()`: your `OnStop`, then every registered device offline, the plugin
 offline, and a disconnect. Then the process exits. Called directly,
 `StopAsync()` ends `RunAsync()` and leaves the process running.
-| `OnManagementCommand` | Legacy escape hatch, tried before `OnAction` |
 
 ## Log forwarding
 

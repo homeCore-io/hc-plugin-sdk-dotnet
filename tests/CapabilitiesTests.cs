@@ -85,4 +85,32 @@ public class CapabilitiesTests
         Assert.Equal("object", json["config_schema"]!["type"]!.GetValue<string>());
         Assert.NotNull(json["config_descriptor"]);
     }
+
+    [Fact]
+    public void SignedInUsesItsWireForm()
+    {
+        var json = new PluginAction
+        {
+            Id = "whoami",
+            Label = "Who am I",
+            RequiresRole = RequiresRole.SignedIn,
+        }.ToJson();
+        Assert.Equal("signed_in", json["requires_role"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void ApiScopesRideOnTheManifestOnlyWhenAskedFor()
+    {
+        // An empty list is left out, so a plugin that wants no key is not
+        // minted one.
+        Assert.False(new Capabilities().ToJson().ContainsKey("api_scopes"));
+
+        var json = new Capabilities
+        {
+            ApiScopes = new[] { "devices:read", "devices:command" },
+        }.ToJson();
+        Assert.Equal(
+            new[] { "devices:read", "devices:command" },
+            json["api_scopes"]!.AsArray().Select(x => x!.GetValue<string>()));
+    }
 }
