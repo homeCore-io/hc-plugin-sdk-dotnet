@@ -152,6 +152,14 @@ public sealed class PluginClient : IAsyncDisposable
 
     private ManagementOptions? _mgmt;
     private CancellationTokenSource? _heartbeatCts;
+    private int _heartbeatLoops;
+
+    // What ConnectAsync connected with, so a dropped connection can be
+    // reconnected; whether a reconnect loop is running; and whether the
+    // plugin is stopping, when a disconnect is expected.
+    private MqttClientOptions? _mqttOptions;
+    private int _reconnecting;
+    private volatile bool _closing;
 
     // Devices this plugin has registered. Drives the heartbeat's device_count,
     // decides which command topics we subscribe to, and — once persistence is
@@ -195,8 +203,28 @@ public sealed class PluginClient : IAsyncDisposable
     /// Return a JsonObject response or null to use the default "unknown action" response.</summary>
     public event ManagementCommandHandler? OnManagementCommand;
 
-    /// <summary>Fired after the MQTT connection is established.</summary>
+    /// <summary>
+    /// Fired after the MQTT connection is established: by
+    /// <see cref="ConnectAsync"/>, and again after every reconnect. Register
+    /// devices and call <see cref="EnableManagementAsync"/> here.
+    /// </summary>
     public event Func<Task>? OnConnected;
+
+    /// <summary>
+    /// Fired when the broker connection is lost, before the SDK starts
+    /// reconnecting. Not fired when the plugin is stopping. Publishes fail
+    /// until <see cref="OnConnected"/> fires again.
+    /// </summary>
+    public event Func<Task>? OnDisconnected;
+
+    /// <summary>The wait before the first reconnect attempt; it doubles up to <see cref="ReconnectDelayMax"/>.</summary>
+    internal TimeSpan ReconnectDelay { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>The longest wait between reconnect attempts.</summary>
+    internal TimeSpan ReconnectDelayMax { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Heartbeat loops running now. One once management is enabled.</summary>
+    internal int HeartbeatLoops => Volatile.Read(ref _heartbeatLoops);
 
     /// <summary>Handles capability actions. See <see cref="ActionHandler"/>.</summary>
     public ActionHandler? OnAction { get; set; }
@@ -315,11 +343,17 @@ public sealed class PluginClient : IAsyncDisposable
         });
 
         _mqtt.ApplicationMessageReceivedAsync += HandleMessageAsync;
+        _mqtt.DisconnectedAsync += HandleDisconnectedAsync;
     }
 
     // ── Connection ────────────────────────────────────────────────────────
 
     /// <summary>Connect to the HomeCore MQTT broker.</summary>
+    /// <remarks>
+    /// Throws when the broker can't be reached. Once connected, a lost
+    /// connection is reconnected on its own: <see cref="OnDisconnected"/>
+    /// fires, then <see cref="OnConnected"/> again once the SDK is back.
+    /// </remarks>
     public async Task ConnectAsync(CancellationToken ct = default)
     {
         Supervised.Watch(_options.PluginId, _logger);
@@ -336,9 +370,19 @@ public sealed class PluginClient : IAsyncDisposable
 
         var mqttOptions = builder.Build();
         await _mqtt.ConnectAsync(mqttOptions, ct);
+        _mqttOptions = mqttOptions;
         _logger.LogInformation("Connected to HomeCore broker at {Host}:{Port}",
             _options.EffectiveBrokerHost, _options.EffectiveBrokerPort);
+        await AfterConnectAsync(ct);
+    }
 
+    /// <summary>
+    /// What every connect does, the first and each reconnect: subscribe to
+    /// what the broker forgot, say the alerts and manifest again, and run
+    /// <see cref="OnConnected"/>.
+    /// </summary>
+    private async Task AfterConnectAsync(CancellationToken ct)
+    {
         // Re-subscribe to the devices we already knew about. On a reconnect the
         // broker has forgotten our subscriptions, and OnConnected may register
         // the same devices again — idempotent, but this covers lazy
@@ -701,9 +745,12 @@ public sealed class PluginClient : IAsyncDisposable
         await PublishCapabilitiesAsync();
 
         // Start heartbeat publisher, and beat once now rather than making the
-        // operator wait a full interval to see the plugin at all.
-        _heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        _ = Task.Run(() => HeartbeatLoopAsync(options, _heartbeatCts.Token), _heartbeatCts.Token);
+        // operator wait a full interval to see the plugin at all. OnConnected
+        // calls this again after every reconnect, so replace the loop a
+        // previous call started rather than adding one.
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Interlocked.Exchange(ref _heartbeatCts, cts)?.Cancel();
+        _ = Task.Run(() => HeartbeatLoopAsync(options, cts.Token), cts.Token);
         await PublishHeartbeatAsync();
 
         _logger.LogInformation(
@@ -783,6 +830,7 @@ public sealed class PluginClient : IAsyncDisposable
 
     private async Task StopOnceAsync()
     {
+        _closing = true;
         if (OnStop is { } hook)
         {
             try
@@ -846,12 +894,83 @@ public sealed class PluginClient : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _closing = true;
         foreach (var registration in _signals)
             registration.Dispose();
         _heartbeatCts?.Cancel();
         if (_mqtt.IsConnected)
             await _mqtt.DisconnectAsync();
         _mqtt.Dispose();
+    }
+
+    // ── Internal: Reconnecting ────────────────────────────────────────────
+
+    private Task HandleDisconnectedAsync(MqttClientDisconnectedEventArgs e)
+    {
+        // A failed attempt inside the reconnect loop also lands here, with
+        // ClientWasConnected false: the loop is already handling it.
+        if (!e.ClientWasConnected || _closing || _mqttOptions is null)
+            return Task.CompletedTask;
+        _logger.LogWarning("Lost the connection to the HomeCore broker ({Reason}); reconnecting",
+            e.Reason);
+        StartReconnecting();
+        return Task.CompletedTask;
+    }
+
+    private void StartReconnecting()
+    {
+        if (Interlocked.Exchange(ref _reconnecting, 1) == 1) return;
+        _ = Task.Run(ReconnectLoopAsync);
+    }
+
+    /// <summary>
+    /// Try to connect again, waiting longer after each failure, until it works
+    /// or the plugin stops; then do what every connect does.
+    /// </summary>
+    private async Task ReconnectLoopAsync()
+    {
+        if (OnDisconnected is { } hook)
+        {
+            try { await hook(); }
+            catch (Exception ex) { _logger.LogError(ex, "OnDisconnected failed"); }
+        }
+
+        var delay = ReconnectDelay;
+        var connected = false;
+        while (!_closing)
+        {
+            await Task.Delay(delay);
+            if (_closing) break;
+            try
+            {
+                await _mqtt.ConnectAsync(_mqttOptions!);
+                connected = true;
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("Reconnect failed ({Error}); trying again in {Delay}s",
+                    ex.Message, delay.TotalSeconds);
+                delay = TimeSpan.FromTicks(Math.Min(delay.Ticks * 2, ReconnectDelayMax.Ticks));
+            }
+        }
+        Interlocked.Exchange(ref _reconnecting, 0);
+        if (!connected) return;
+
+        _logger.LogInformation("Reconnected to HomeCore broker at {Host}:{Port}",
+            _options.EffectiveBrokerHost, _options.EffectiveBrokerPort);
+        try
+        {
+            await AfterConnectAsync(CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "After reconnecting");
+        }
+        // Dropped again before the flag was cleared, when no disconnect
+        // started a loop of its own.
+        if (!_mqtt.IsConnected && !_closing)
+            StartReconnecting();
     }
 
     // ── Internal: Message Routing ─────────────────────────────────────────
@@ -1249,15 +1368,31 @@ public sealed class PluginClient : IAsyncDisposable
 
     private async Task HeartbeatLoopAsync(ManagementOptions options, CancellationToken ct)
     {
+        Interlocked.Increment(ref _heartbeatLoops);
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(options.HeartbeatIntervalSecs));
         try
         {
             while (await timer.WaitForNextTickAsync(ct))
-                await PublishHeartbeatAsync();
+            {
+                try
+                {
+                    await PublishHeartbeatAsync();
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // Disconnected, most likely. Keep beating: the reconnect
+                    // will bring the broker back.
+                    _logger.LogDebug("Heartbeat not sent: {Error}", ex.Message);
+                }
+            }
         }
         catch (OperationCanceledException)
         {
-            // Shutting down.
+            // Replaced, or shutting down.
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _heartbeatLoops);
         }
     }
 
