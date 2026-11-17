@@ -4,12 +4,21 @@
 // discovered, which is the situation notices exist for: without one it would
 // sit there looking healthy and doing nothing.
 //
-// Build and run it against a homeCore:
+// Build and run it against a homeCore. Create the project beside the SDK's
+// folder, not inside it: the SDK's project file compiles every .cs file under
+// its folder, so a project created there gets built into the library.
 //
-//   dotnet new console -o DiscoveryDemo && cd DiscoveryDemo
-//   dotnet add reference ../HomeCoreSdk.csproj
-//   cp ../examples/DiscoveryPlugin.cs Program.cs
-//   dotnet run
+//   # from the folder that holds hc-plugin-sdk-dotnet
+//   dotnet new console -o DiscoveryDemo
+//   cd DiscoveryDemo
+//   dotnet add reference ../hc-plugin-sdk-dotnet/HomeCoreSdk.csproj
+//   cp ../hc-plugin-sdk-dotnet/examples/DiscoveryPlugin.cs Program.cs
+//   HC_BROKER_HOST=127.0.0.1 dotnet run
+//
+// The environment variables are for trying it by hand. homeCore starts a
+// plugin with its config file as the only argument, and a real plugin reads
+// the broker, plugin id and password from that file's [homecore] table; the
+// README's "Your first plugin" shows how.
 //
 // Then, in the web UI, open Plugins → Discovery Demo and you will see:
 //
@@ -24,8 +33,8 @@ using System.Text.Json.Nodes;
 using HomeCore.PluginSdk;
 
 // Stand-ins for a real network sweep.
-var candidateHosts = Enumerable.Range(10, 6).Select(n => $"10.0.0.{n}").ToList();
-var hubsThatAnswer = new Dictionary<string, string> { ["10.0.0.12"] = "HUB-A1B2" };
+var candidateHosts = Enumerable.Range(10, 6).Select(n => $"192.168.1.{n}").ToList();
+var hubsThatAnswer = new Dictionary<string, string> { ["192.168.1.12"] = "HUB-A1B2" };
 
 string? hubHost = null;
 
@@ -119,11 +128,13 @@ client.OnAction = async (action, @params, ctx) =>
             };
 
         case "forget_hub":
-            if (hubHost is null) return new JsonObject { ["status"] = "nothing to forget" };
+            // The result is merged into the response, whose "status" says
+            // whether the action succeeded, so the result can't use that key.
+            if (hubHost is null) return new JsonObject { ["outcome"] = "nothing to forget" };
             await client.UnregisterDeviceAsync($"hub_{hubsThatAnswer[hubHost]}");
             hubHost = null;
             RefreshNotices();
-            return new JsonObject { ["status"] = "forgotten" };
+            return new JsonObject { ["outcome"] = "forgotten" };
 
         default:
             return null; // not ours — the SDK answers "unknown action"
