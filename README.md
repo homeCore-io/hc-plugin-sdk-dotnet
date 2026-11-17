@@ -146,9 +146,8 @@ Four consequences worth internalising:
 1. **Publish what happened, not what was asked.** A command is a request. If the
    bulb refuses, publish the state it is actually in. That is why the UI can
    show a light as off after a failed command instead of lying.
-2. **Register in `OnConnected`.** It fires once `ConnectAsync` has connected
-   and subscribed to what the SDK needs. This SDK does not reconnect on its
-   own; see "When the connection drops" below.
+2. **Register in `OnConnected`.** It fires on every connect, so a reconnect
+   re-registers and re-subscribes. See "When the connection drops" below.
 3. **You only see your own devices.** Registering a device subscribes to that
    device's command topic and nothing else.
 4. **Use homeCore's names and units.** A shared idea has one name, one unit:
@@ -198,18 +197,33 @@ enabled = true
 
 ## When the connection drops
 
-This SDK does not reconnect. If the broker connection is lost (homeCore
-restarted, the network dropped), the client stays disconnected: `OnConnected`
-does not fire again, heartbeats stop, every publish throws
-`MqttClientNotConnectedException`, and `RunAsync()` keeps waiting. homeCore
-restarts a plugin it started once it has gone 5 minutes without a heartbeat,
-and the new process connects and registers from the start.
+If the broker connection is lost after `ConnectAsync` succeeded (homeCore
+restarted, the network dropped), the SDK reconnects on its own, as the Python
+and Node.js SDKs do:
 
-To come back sooner, end the process yourself: when a publish throws because
-the client is not connected, exit with a non-zero code. homeCore restarts a
-plugin that exits, after a short backoff (2 seconds at first). A first
-`ConnectAsync` that can't reach the broker throws too; let that end the
-process for the same reason.
+1. `OnDisconnected` fires. Publishes fail until the connection is back.
+2. The SDK tries again after 1 second, doubling the wait up to 30 seconds.
+   `RunAsync()` keeps waiting meanwhile.
+3. Once connected, it subscribes again to your devices' commands and the
+   management topic, says your alerts and manifest again, and fires
+   `OnConnected`, so the plugin registers its devices and calls
+   `EnableManagementAsync` as it did the first time. That replaces the
+   heartbeat loop, so there is still exactly one.
+
+```csharp
+client.OnDisconnected += () =>
+{
+    log.LogWarning("lost homeCore's broker; the SDK is reconnecting");
+    return Task.CompletedTask;
+};
+```
+
+`StopAsync` (and SIGTERM, and Ctrl-C) is not a dropped connection: it fires no
+`OnDisconnected` and starts no reconnect.
+
+A first `ConnectAsync` that can't reach the broker throws. Let it end the
+process with a non-zero code; homeCore restarts a plugin that exits, after a
+short backoff (2 seconds at first).
 
 ## Management: heartbeat, config, actions
 
@@ -586,7 +600,8 @@ the change, so the UI and the audit log can say so.
 
 | Member | When |
 |---|---|
-| `OnConnected` | Connected. Register devices, enable management |
+| `OnConnected` | Connected, the first time and after every reconnect. Register devices, enable management |
+| `OnDisconnected` | The connection dropped; the SDK is reconnecting |
 | `OnCommand` | A command for one of your devices |
 | `OnAction` | A capability action; `ctx` is non-null only when streaming |
 | `OnActionWithCaller` | The same, with the `Caller`; used in place of `OnAction` when set |
