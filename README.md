@@ -29,25 +29,81 @@ edit in `sdks/hc-plugin-sdk-dotnet` takes effect on the next `dotnet build`.
 
 ### From a release
 
+Nothing is published to NuGet yet, and NuGet can't install from git, so install
+from the GitHub tag: clone it beside your plugin's project and add a project
+reference.
+
 ```bash
-git clone --branch v0.2.0 https://github.com/homeCore-io/hc-plugin-sdk-dotnet
+# from the folder that holds your plugin's project folder
+git clone --branch v0.4.5 https://github.com/homeCore-io/hc-plugin-sdk-dotnet
+cd hc-mylight
 dotnet add reference ../hc-plugin-sdk-dotnet/HomeCoreSdk.csproj
 ```
 
-**Nothing is published to NuGet**, and NuGet has no git-install equivalent, so
-the release route is a clone at the tag plus a project reference.
+Keep your project in its own folder beside the SDK's, never inside it: the
+SDK's project file compiles every `.cs` file under its folder, so a plugin
+created there gets built into the library.
 
 ## Your first plugin
+
+homeCore starts a plugin with one argument, the path of its config file, and
+writes a `[homecore]` table into that file with everything needed to log in to
+its broker:
+
+```toml
+[homecore]
+broker_host = "127.0.0.1"
+broker_port = 1883
+plugin_id   = "plugin.mylight"
+password    = "..."
+```
+
+This SDK has no config loader, so the plugin reads the file itself. Any TOML
+parser works; this uses [Tomlyn](https://www.nuget.org/packages/Tomlyn) 1.0 or
+later, and logs to the console:
+
+```bash
+dotnet new console -o hc-mylight
+cd hc-mylight
+dotnet add reference ../hc-plugin-sdk-dotnet/HomeCoreSdk.csproj
+dotnet add package Tomlyn
+dotnet add package Microsoft.Extensions.Logging.Console
+```
 
 ```csharp
 using System.Text.Json.Nodes;
 using HomeCore.PluginSdk;
+using Microsoft.Extensions.Logging;
+using Tomlyn;
+using Tomlyn.Model;
 
-var client = new PluginClient(new PluginOptions { PluginId = "plugin.mylight" });
+// homeCore starts a plugin as `<binary> <config path>`.
+if (args.Length < 1)
+{
+    Console.Error.WriteLine("usage: hc-mylight <config.toml>");
+    return 2;
+}
+var configPath = args[0];
+var config = TomlSerializer.Deserialize<TomlTable>(File.ReadAllText(configPath))!;
+var hc = (TomlTable)config["homecore"]!;
+
+using var logs = LoggerFactory.Create(b => b.AddConsole());
+
+var client = new PluginClient(new PluginOptions
+{
+    PluginId = (string)hc["plugin_id"],
+    BrokerHost = hc.TryGetValue("broker_host", out var host) ? (string)host : null,
+    BrokerPort = hc.TryGetValue("broker_port", out var port) ? (int)(long)port : null,
+    Password = hc.TryGetValue("password", out var password) ? (string)password : null,
+}, logs.CreateLogger("mylight"));
 
 client.OnConnected += async () =>
 {
-    // Register here, not before connecting — this runs again after a reconnect.
+    await client.EnableManagementAsync(new ManagementOptions
+    {
+        Version = "1.0.0",
+        ConfigPath = configPath,
+    });
     await client.RegisterDeviceFullAsync("light.01", "Desk Lamp", deviceType: "light");
     await client.PublishAvailabilityAsync("light.01", true);
     await client.PublishStateAsync("light.01", new { on = false, brightness_pct = 0 });
@@ -55,7 +111,7 @@ client.OnConnected += async () =>
 
 client.OnCommand += async (deviceId, payload) =>
 {
-    // Do whatever the real device needs, then publish what actually happened —
+    // Do whatever the real device needs, then publish what actually happened:
     // homeCore never writes device state itself.
     var state = new JsonObject { ["on"] = payload.GetProperty("on").GetBoolean() };
     await client.PublishStateForCommandAsync(deviceId, state, payload, "mylight");
@@ -63,10 +119,17 @@ client.OnCommand += async (deviceId, payload) =>
 
 await client.ConnectAsync();
 await client.RunAsync();
+return 0;
 ```
 
-Point it at a broker with `PluginOptions`, or the `HC_BROKER_HOST` /
-`HC_BROKER_PORT` / `HC_PLUGIN_PASSWORD` environment variables.
+Take the plugin id from `plugin_id`: homeCore minted the password for that id,
+and the broker refuses any other. Keep your own settings in other tables of the
+same file, and pass `ConfigPath` to `EnableManagementAsync` so homeCore's
+config editor edits that same file.
+
+`PluginOptions` left unset fall back to the `HC_BROKER_HOST` /
+`HC_BROKER_PORT` / `HC_PLUGIN_PASSWORD` environment variables, which are for
+running a plugin by hand without a config file.
 
 ## How a plugin fits into homeCore
 
@@ -83,8 +146,9 @@ Four consequences worth internalising:
 1. **Publish what happened, not what was asked.** A command is a request. If the
    bulb refuses, publish the state it is actually in. That is why the UI can
    show a light as off after a failed command instead of lying.
-2. **Register in `OnConnected`.** It fires on every connect, so a reconnect
-   re-registers and re-subscribes.
+2. **Register in `OnConnected`.** It fires once `ConnectAsync` has connected
+   and subscribed to what the SDK needs. This SDK does not reconnect on its
+   own; see "When the connection drops" below.
 3. **You only see your own devices.** Registering a device subscribes to that
    device's command topic and nothing else.
 4. **Use homeCore's names and units.** A shared idea has one name, one unit:
@@ -101,21 +165,51 @@ Four consequences worth internalising:
 ## Installing it into homeCore
 
 homeCore owns your plugin's config at `config/plugins/<plugin_id>.toml` and
-passes the path as the first argument:
+starts the plugin as `<binary> <config path>`, so the path arrives as
+`args[0]`.
 
-```csharp
-var configPath = args.Length > 0 ? args[0] : "config/config.toml";
+Because the config path is the only argument, `binary` has to be an executable
+that runs your plugin by itself. `/usr/bin/dotnet` won't work: it would be
+started as `dotnet <config path>` and try to run the config file. Publish the
+plugin, and point `binary` at the executable the publish writes (named after
+the project):
+
+```bash
+# needs the .NET runtime on the machine that runs it
+dotnet publish -c Release -o /opt/hc-mylight
+
+# or bundle the runtime, so the machine needs no .NET at all
+dotnet publish -c Release -r linux-x64 --self-contained -o /opt/hc-mylight
 ```
+
+The first form looks for .NET in the usual places (`/usr/share/dotnet`, or
+`DOTNET_ROOT` when set). Use the second when the runtime isn't installed where
+it can find it, or to make the plugin a single folder to copy.
 
 Declare the plugin in homeCore's `homecore.toml` so it gets supervised:
 
 ```toml
 [[plugins]]
 id      = "plugin.mylight"
-binary  = "/usr/bin/dotnet"
+binary  = "/opt/hc-mylight/hc-mylight"
 config  = "config/plugins/plugin.mylight.toml"
 enabled = true
 ```
+
+## When the connection drops
+
+This SDK does not reconnect. If the broker connection is lost (homeCore
+restarted, the network dropped), the client stays disconnected: `OnConnected`
+does not fire again, heartbeats stop, every publish throws
+`MqttClientNotConnectedException`, and `RunAsync()` keeps waiting. homeCore
+restarts a plugin it started once it has gone 5 minutes without a heartbeat,
+and the new process connects and registers from the start.
+
+To come back sooner, end the process yourself: when a publish throws because
+the client is not connected, exit with a non-zero code. homeCore restarts a
+plugin that exits, after a short backoff (2 seconds at first). A first
+`ConnectAsync` that can't reach the broker throws too; let that end the
+process for the same reason.
 
 ## Management: heartbeat, config, actions
 
@@ -128,7 +222,7 @@ await client.EnableManagementAsync(new ManagementOptions
 {
     HeartbeatIntervalSecs = 60,   // core marks a plugin offline after 90s
     Version = "1.2.0",
-    ConfigPath = configPath,
+    ConfigPath = configPath,      // args[0], the file homeCore passed
 });
 ```
 
@@ -512,7 +606,12 @@ offline, and a disconnect. Then the process exits. Called directly,
 
 Send this plugin's logs to homeCore's live log stream, so they appear alongside
 core's own instead of only in the plugin's stdout. Register the provider on any
-logging builder and everything the plugin logs is forwarded:
+logging builder and everything the plugin logs is forwarded. `AddConsole()`
+comes from a package the SDK doesn't reference, so add it to your plugin:
+
+```bash
+dotnet add package Microsoft.Extensions.Logging.Console
+```
 
 ```csharp
 client.EnableLogForwarding(LogLevel.Information);
@@ -628,7 +727,7 @@ The library targets net8.0; the test project targets the current runtime, so
 `dotnet test` works on a machine that has only the latest .NET installed.
 
 `examples/DiscoveryPlugin.cs` demonstrates notices and both kinds of capability
-action.
+action. Its header says how to run it from a project beside the SDK's folder.
 
 ## License
 
