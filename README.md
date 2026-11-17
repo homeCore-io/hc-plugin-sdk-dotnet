@@ -35,7 +35,7 @@ reference.
 
 ```bash
 # from the folder that holds your plugin's project folder
-git clone --branch v0.4.5 https://github.com/homeCore-io/hc-plugin-sdk-dotnet
+git clone --branch v0.4.6 https://github.com/homeCore-io/hc-plugin-sdk-dotnet
 cd hc-mylight
 dotnet add reference ../hc-plugin-sdk-dotnet/HomeCoreSdk.csproj
 ```
