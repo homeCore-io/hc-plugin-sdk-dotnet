@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Globalization;
 using System.Text.Json.Nodes;
 using System.Threading.Channels;
@@ -76,7 +77,16 @@ public sealed class StreamContext
     /// it is written, say). Sent as <c>data</c>; the generic UI ignores it.
     /// </param>
     public Task ProgressAsync(
-        int? percent = null, string? label = null, string? message = null, JsonObject? data = null)
+        int? percent = null, string? label = null, string? message = null, JsonObject? data = null) =>
+        Progress(percent, label, message, data);
+
+    // 0.4.4's signature, kept so a plugin built against 0.4.4 still runs with
+    // this DLL. A call that passes every argument but data compiles to it.
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task ProgressAsync(int? percent, string? label, string? message) =>
+        Progress(percent, label, message, null);
+
+    private Task Progress(int? percent, string? label, string? message, JsonObject? data)
     {
         var ev = new JsonObject { ["stage"] = "progress" };
         if (percent is not null) ev["percent"] = percent;
@@ -128,7 +138,15 @@ public sealed class StreamContext
     /// a change, say). Sent as <c>data</c>; the generic UI ignores it.
     /// </param>
     public Task AwaitingUserAsync(
-        string prompt, JsonNode? responseSchema = null, JsonObject? data = null)
+        string prompt, JsonNode? responseSchema = null, JsonObject? data = null) =>
+        AwaitingUser(prompt, responseSchema, data);
+
+    // 0.4.4's signature, kept for plugins built against it (see ProgressAsync).
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task AwaitingUserAsync(string prompt, JsonNode? responseSchema) =>
+        AwaitingUser(prompt, responseSchema, null);
+
+    private Task AwaitingUser(string prompt, JsonNode? responseSchema, JsonObject? data)
     {
         var ev = new JsonObject { ["stage"] = "awaiting_user", ["prompt"] = prompt };
         if (responseSchema is not null) ev["response_schema"] = responseSchema.DeepClone();
